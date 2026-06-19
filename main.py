@@ -90,10 +90,6 @@ class MemoryMeet:
         self._thread_sys      = None
         self._ultimo_arquivo  = None
         self._duracao_gravada = 0
-        self._anim_job        = None
-        self._anim_base       = ""
-        self._anim_dots       = 0
-        self._anim_color      = ORANGE
 
         self.p = pyaudio.PyAudio()
         try:
@@ -130,6 +126,14 @@ class MemoryMeet:
         )
         self.lbl_status.pack(pady=(10, 0))
         self.lbl_status.bind("<Button-1>", self._abrir_arquivo)
+
+        self.spinner = ctk.CTkProgressBar(
+            self.root, width=160, height=4,
+            mode="indeterminate", indeterminate_speed=1.2,
+            progress_color=ORANGE, fg_color="#2a2a3a"
+        )
+        self.spinner.pack(pady=(6, 0))
+        self.spinner.pack_forget()
 
         self.btn = ctk.CTkButton(
             self.root,
@@ -189,7 +193,7 @@ class MemoryMeet:
                            hover_color="#2a2a3a", text_color="#44445a",
                            state="disabled")
         self._vu_clear()
-        self._start_dot_animation("Finalizando", ORANGE)
+        self.root.after(0, lambda: self._start_spinner("Finalizando", ORANGE))
 
     def _tick(self):
         if self.gravando:
@@ -220,27 +224,14 @@ class MemoryMeet:
 
     # ── dot animation ─────────────────────────────────────────────────────────
 
-    def _start_dot_animation(self, base, color):
-        self._stop_dot_animation()
-        self._anim_base  = base
-        self._anim_color = color
-        self._anim_dots  = 0
-        self._animate_dots()
+    def _start_spinner(self, msg, color):
+        self._set_status(msg, color)
+        self.spinner.pack(pady=(6, 0))
+        self.spinner.start()
 
-    def _animate_dots(self):
-        self._anim_dots = (self._anim_dots + 1) % 4
-        self.lbl_status.configure(
-            text=self._anim_base + "." * self._anim_dots,
-            text_color=self._anim_color,
-            cursor="arrow",
-            font=ctk.CTkFont(size=12)
-        )
-        self._anim_job = self.root.after(400, self._animate_dots)
-
-    def _stop_dot_animation(self):
-        if self._anim_job:
-            self.root.after_cancel(self._anim_job)
-            self._anim_job = None
+    def _stop_spinner(self):
+        self.spinner.stop()
+        self.spinner.pack_forget()
 
     # ── gravação ──────────────────────────────────────────────────────────────
 
@@ -331,7 +322,7 @@ class MemoryMeet:
     def _finalizar(self):
         try:
             if not self._mp3_chunks:
-                self._stop_dot_animation()
+                self._stop_spinner()
                 self._set_status("Nenhum áudio capturado.", RED)
                 self._reativar_btn()
                 return
@@ -343,7 +334,7 @@ class MemoryMeet:
                 for c in self._mp3_chunks:
                     f.write(c)
 
-            self._stop_dot_animation()
+            self._stop_spinner()
             m, s    = divmod(self._duracao_gravada, 60)
             duracao = f"{m}min {s:02d}s"
 
@@ -352,17 +343,14 @@ class MemoryMeet:
                 texto = "\n\n".join(self._transcricoes)
                 with open(txt, "w", encoding="utf-8") as f:
                     f.write(texto)
-                palavras = len(texto.split())
-                self._set_status(f"✓ {duracao} · {palavras:,} palavras — clique para abrir",
-                                 GREEN, arquivo=txt)
+                self._set_status(f"📄 {Path(txt).name}", "#4a9eff", arquivo=txt)
             else:
                 mp3 = base + ".mp3"
-                self._set_status(f"✓ {duracao} · MP3 salvo — clique para abrir",
-                                 GREEN, arquivo=mp3)
+                self._set_status(f"📄 {Path(mp3).name}", "#4a9eff", arquivo=mp3)
 
         except Exception as e:
             logging.error("Erro em _finalizar: %s", e, exc_info=True)
-            self._stop_dot_animation()
+            self._stop_spinner()
             self._set_status(f"Erro: {e}", RED)
         finally:
             self._reativar_btn()
