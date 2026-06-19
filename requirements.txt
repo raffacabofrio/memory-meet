@@ -3,3 +3,4 @@ numpy
 lameenc
 python-dotenv
 openai
+customtkinter

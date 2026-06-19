@@ -1,4 +1,9 @@
+import sys, site
+if site.getusersitepackages() not in sys.path:
+    sys.path.insert(0, site.getusersitepackages())
+
 import tkinter as tk
+import customtkinter as ctk
 import pyaudiowpatch as pyaudio
 import numpy as np
 import threading
@@ -25,12 +30,24 @@ logging.basicConfig(
     encoding="utf-8",
 )
 
-CHUNK = 1024
-FORMAT = pyaudio.paInt16
-CHANNELS = 2
-MP3_BITRATE = 128
-CHUNK_SEGUNDOS = 5 * 60  # processa um pedaço a cada 5 min durante a gravação
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
 
+CHUNK         = 1024
+FORMAT        = pyaudio.paInt16
+CHANNELS      = 2
+MP3_BITRATE   = 128
+CHUNK_SEGUNDOS = 5 * 60
+
+BG      = "#1a1a2e"
+RED     = "#e05050"
+GREEN   = "#50c878"
+ORANGE  = "#f0a030"
+TEXT_DIM = "#55557a"
+VU_W    = 220
+
+
+# ── áudio ─────────────────────────────────────────────────────────────────────
 
 def mix_frames(frames_a, frames_b):
     min_len = min(len(frames_a), len(frames_b))
@@ -38,47 +55,53 @@ def mix_frames(frames_a, frames_b):
         return np.concatenate(frames_a) if frames_a else np.concatenate(frames_b)
     a = np.concatenate(frames_a[:min_len]).astype(np.int32)
     b = np.concatenate(frames_b[:min_len]).astype(np.int32)
-    min_size = min(len(a), len(b))
-    return np.clip((a[:min_size] + b[:min_size]) // 2, -32768, 32767).astype(np.int16)
+    s = min(len(a), len(b))
+    return np.clip((a[:s] + b[:s]) // 2, -32768, 32767).astype(np.int16)
 
 
 def audio_para_mp3(audio, rate):
-    encoder = lameenc.Encoder()
-    encoder.set_bit_rate(MP3_BITRATE)
-    encoder.set_in_sample_rate(rate)
-    encoder.set_channels(CHANNELS)
-    encoder.set_quality(2)
-    mp3 = encoder.encode(audio.tobytes())
-    mp3 += encoder.flush()
-    return mp3
+    enc = lameenc.Encoder()
+    enc.set_bit_rate(MP3_BITRATE)
+    enc.set_in_sample_rate(rate)
+    enc.set_channels(CHANNELS)
+    enc.set_quality(2)
+    return enc.encode(audio.tobytes()) + enc.flush()
 
+
+# ── app ───────────────────────────────────────────────────────────────────────
 
 class MemoryMeet:
     def __init__(self, root):
         self.root = root
         self.root.title("MemoryMeet")
         self.root.resizable(False, False)
-        self.root.geometry("300x200")
+        self.root.geometry("320x260")
+        self.root.configure(fg_color=BG)
 
         icon = Path(__file__).parent / "assets" / "MemoryMeet.ico"
         if icon.exists():
             self.root.iconbitmap(str(icon))
 
-        self.gravando = False
-        self.stop_event = threading.Event()
-        self.start_time = None
-        self.timer_job = None
-        self._thread_mic = None
-        self._thread_sys = None
-        self._ultimo_arquivo = None
+        self.gravando         = False
+        self.stop_event       = threading.Event()
+        self.start_time       = None
+        self.timer_job        = None
+        self._thread_mic      = None
+        self._thread_sys      = None
+        self._ultimo_arquivo  = None
+        self._duracao_gravada = 0
+        self._anim_job        = None
+        self._anim_base       = ""
+        self._anim_dots       = 0
+        self._anim_color      = ORANGE
 
         self.p = pyaudio.PyAudio()
         try:
-            self.loopback = self.p.get_default_wasapi_loopback()
-            self.rate = int(self.loopback["defaultSampleRate"])
+            self.loopback      = self.p.get_default_wasapi_loopback()
+            self.rate          = int(self.loopback["defaultSampleRate"])
             self.loop_channels = min(int(self.loopback["maxInputChannels"]), 2)
-            self.sample_width = self.p.get_sample_size(FORMAT)
-            logging.info("Inicializado. Loopback: %s | rate: %d", self.loopback["name"], self.rate)
+            self.sample_width  = self.p.get_sample_size(FORMAT)
+            logging.info("Loopback: %s | rate: %d", self.loopback["name"], self.rate)
         except Exception as e:
             logging.error("Falha ao inicializar loopback: %s", e)
             self.loopback = None
@@ -86,31 +109,45 @@ class MemoryMeet:
         self._build_ui()
 
     def _build_ui(self):
-        self.root.configure(bg="#1e1e1e")
-
-        self.lbl_timer = tk.Label(
-            self.root, text="00:00", font=("Courier", 48, "bold"),
-            bg="#1e1e1e", fg="#ffffff"
+        self.lbl_timer = ctk.CTkLabel(
+            self.root, text="00:00",
+            font=ctk.CTkFont(family="Courier", size=52, weight="bold"),
+            text_color="#e0e0f8"
         )
-        self.lbl_timer.pack(pady=(20, 0))
+        self.lbl_timer.pack(pady=(24, 0))
 
-        self.lbl_status = tk.Label(
-            self.root, text="Pronto", font=("Segoe UI", 11),
-            bg="#1e1e1e", fg="#888888", cursor="arrow"
+        # VU meter — mantém Canvas para controle de cor dinâmica
+        self.vu_canvas = tk.Canvas(
+            self.root, width=VU_W, height=5,
+            bg="#13131f", highlightthickness=0
         )
-        self.lbl_status.pack(pady=(4, 0))
+        self.vu_canvas.pack(pady=(12, 0))
+
+        self.lbl_status = ctk.CTkLabel(
+            self.root, text="Pronto",
+            font=ctk.CTkFont(size=12),
+            text_color=TEXT_DIM, cursor="arrow"
+        )
+        self.lbl_status.pack(pady=(10, 0))
         self.lbl_status.bind("<Button-1>", self._abrir_arquivo)
 
-        self.btn = tk.Button(
-            self.root, text="● Gravar", font=("Segoe UI", 13, "bold"),
-            bg="#c0392b", fg="white", relief="flat", cursor="hand2",
-            padx=20, pady=8, command=self.toggle
+        self.btn = ctk.CTkButton(
+            self.root,
+            text="● Gravar",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            width=200, height=50,
+            corner_radius=25,
+            fg_color=RED,
+            hover_color="#c03030",
+            command=self.toggle
         )
         self.btn.pack(pady=(20, 0))
 
         if self.loopback is None:
-            self.lbl_status.config(text="Erro: loopback não encontrado", fg="#e74c3c")
-            self.btn.config(state="disabled")
+            self._set_status("Erro: loopback não encontrado", RED)
+            self.btn.configure(state="disabled")
+
+    # ── controle ──────────────────────────────────────────────────────────────
 
     def toggle(self):
         if self.gravando:
@@ -121,18 +158,19 @@ class MemoryMeet:
     def iniciar(self):
         self.gravando = True
         self.stop_event.clear()
-        self.mic_frames = []
-        self.sys_frames = []
-        self._mp3_chunks = []
+        self.mic_frames    = []
+        self.sys_frames    = []
+        self._mp3_chunks   = []
         self._transcricoes = []
-        self._chunk_index = 0
+        self._chunk_index  = 0
         self._ultimo_arquivo = None
 
-        self.btn.config(text="■ Parar", bg="#555555")
-        self.lbl_status.config(text="Gravando...", fg="#e74c3c", cursor="arrow")
+        self.btn.configure(text="■ Parar", fg_color="#333344", hover_color="#444455")
+        self._set_status("Gravando...", RED)
 
         self.start_time = time.time()
         self._tick()
+        self._vu_tick()
 
         logging.info("Gravação iniciada")
         self._thread_mic = threading.Thread(target=self._record_mic, daemon=True)
@@ -143,18 +181,68 @@ class MemoryMeet:
 
     def parar(self):
         self.gravando = False
+        self._duracao_gravada = int(time.time() - self.start_time)
         self.stop_event.set()
         if self.timer_job:
             self.root.after_cancel(self.timer_job)
-        self.btn.config(state="disabled", text="● Gravar", bg="#c0392b")
-        self.lbl_status.config(text="Finalizando...", fg="#f39c12", cursor="arrow")
+        self.btn.configure(text="● Gravar", fg_color="#2a2a3a",
+                           hover_color="#2a2a3a", text_color="#44445a",
+                           state="disabled")
+        self._vu_clear()
+        self._start_dot_animation("Finalizando", ORANGE)
 
     def _tick(self):
         if self.gravando:
             elapsed = int(time.time() - self.start_time)
             m, s = divmod(elapsed, 60)
-            self.lbl_timer.config(text=f"{m:02d}:{s:02d}")
+            self.lbl_timer.configure(text=f"{m:02d}:{s:02d}")
             self.timer_job = self.root.after(1000, self._tick)
+
+    # ── VU meter ──────────────────────────────────────────────────────────────
+
+    def _vu_tick(self):
+        if not self.gravando:
+            return
+        if self.mic_frames:
+            rms   = float(np.sqrt(np.mean(self.mic_frames[-1].astype(np.float32) ** 2)))
+            level = min(rms / 6000, 1.0)
+            self._vu_draw(level)
+        self.root.after(80, self._vu_tick)
+
+    def _vu_draw(self, level):
+        self.vu_canvas.delete("all")
+        w = max(1, int(VU_W * level))
+        color = GREEN if level < 0.6 else (ORANGE if level < 0.85 else RED)
+        self.vu_canvas.create_rectangle(0, 0, w, 5, fill=color, outline="")
+
+    def _vu_clear(self):
+        self.vu_canvas.delete("all")
+
+    # ── dot animation ─────────────────────────────────────────────────────────
+
+    def _start_dot_animation(self, base, color):
+        self._stop_dot_animation()
+        self._anim_base  = base
+        self._anim_color = color
+        self._anim_dots  = 0
+        self._animate_dots()
+
+    def _animate_dots(self):
+        self._anim_dots = (self._anim_dots + 1) % 4
+        self.lbl_status.configure(
+            text=self._anim_base + "." * self._anim_dots,
+            text_color=self._anim_color,
+            cursor="arrow",
+            font=ctk.CTkFont(size=12)
+        )
+        self._anim_job = self.root.after(400, self._animate_dots)
+
+    def _stop_dot_animation(self):
+        if self._anim_job:
+            self.root.after_cancel(self._anim_job)
+            self._anim_job = None
+
+    # ── gravação ──────────────────────────────────────────────────────────────
 
     def _record_mic(self):
         try:
@@ -163,8 +251,7 @@ class MemoryMeet:
             while not self.stop_event.is_set():
                 data = stream.read(CHUNK, exception_on_overflow=False)
                 self.mic_frames.append(np.frombuffer(data, dtype=np.int16).copy())
-            stream.stop_stream()
-            stream.close()
+            stream.stop_stream(); stream.close()
             logging.info("Mic encerrado. Frames: %d", len(self.mic_frames))
         except Exception as e:
             logging.error("Erro mic: %s", e, exc_info=True)
@@ -176,127 +263,149 @@ class MemoryMeet:
                                  frames_per_buffer=CHUNK)
             while not self.stop_event.is_set():
                 data = stream.read(CHUNK, exception_on_overflow=False)
-                arr = np.frombuffer(data, dtype=np.int16).copy()
+                arr  = np.frombuffer(data, dtype=np.int16).copy()
                 if self.loop_channels == 1:
                     arr = np.repeat(arr, 2)
                 self.sys_frames.append(arr)
-            stream.stop_stream()
-            stream.close()
+            stream.stop_stream(); stream.close()
             logging.info("Sistema encerrado. Frames: %d", len(self.sys_frames))
         except Exception as e:
             logging.error("Erro sistema: %s", e, exc_info=True)
 
     def _swap_frames(self):
-        # Troca atômica — recording threads passam a escrever na nova lista vazia
-        mic = self.mic_frames
-        sys = self.sys_frames
-        self.mic_frames = []
-        self.sys_frames = []
+        mic, sys = self.mic_frames, self.sys_frames
+        self.mic_frames, self.sys_frames = [], []
         return mic, sys
 
     def _chunk_loop(self):
         while True:
             parou = self.stop_event.wait(timeout=CHUNK_SEGUNDOS)
-
             if parou:
-                # Aguarda threads de gravação terminarem antes do chunk final
                 for t in (self._thread_mic, self._thread_sys):
                     if t:
                         t.join(timeout=10)
-
             mic, sys = self._swap_frames()
-
             if mic or sys:
                 self._chunk_index += 1
-                label = "final" if parou else f"{self._chunk_index}"
-                self._processar_chunk(mic, sys, label)
-
+                self._processar_chunk(mic, sys, is_final=parou)
             if parou:
                 break
-
         self._finalizar()
 
-    def _processar_chunk(self, mic, sys, label):
+    def _processar_chunk(self, mic, sys, is_final=False):
+        label = "final" if is_final else str(self._chunk_index)
         try:
-            if mic and sys:
-                audio = mix_frames(mic, sys)
-            elif mic:
-                audio = np.concatenate(mic)
-            else:
-                audio = np.concatenate(sys)
+            audio = mix_frames(mic, sys) if (mic and sys) else (
+                    np.concatenate(mic) if mic else np.concatenate(sys))
 
-            logging.info("Chunk %s — mixing. Samples: %d", label, len(audio))
+            logging.info("Chunk %s — samples: %d", label, len(audio))
             mp3 = audio_para_mp3(audio, self.rate)
             self._mp3_chunks.append(mp3)
-            logging.info("Chunk %s — MP3 pronto (%.1f MB)", label, len(mp3) / 1024 / 1024)
+            logging.info("Chunk %s — MP3 %.1f MB", label, len(mp3) / 1024 / 1024)
 
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
                 return
 
-            client = OpenAI(api_key=api_key)
-            resultado = client.audio.transcriptions.create(
+            resultado = OpenAI(api_key=api_key).audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe",
                 file=("audio.mp3", io.BytesIO(mp3)),
                 timeout=120,
             )
             self._transcricoes.append(resultado.text)
-            logging.info("Chunk %s — transcrito. Chars: %d", label, len(resultado.text))
+            logging.info("Chunk %s — %d chars", label, len(resultado.text))
+
+            if not is_final and self.gravando:
+                self._flash_status("✓ trecho processado", GREEN, restore_after_ms=3000)
 
         except Exception as e:
-            logging.error("Erro no chunk %s: %s", label, e, exc_info=True)
+            logging.error("Erro chunk %s: %s", label, e, exc_info=True)
+
+    def _flash_status(self, msg, color, restore_after_ms=3000):
+        self._stop_dot_animation()
+        self.lbl_status.configure(text=msg, text_color=color, cursor="arrow",
+                                  font=ctk.CTkFont(size=12))
+        self.root.after(restore_after_ms,
+                        lambda: self._set_status("Gravando...", RED) if self.gravando else None)
 
     def _finalizar(self):
         try:
             if not self._mp3_chunks:
-                self._set_status("Nenhum áudio capturado.", "#e74c3c")
+                self._stop_dot_animation()
+                self._set_status("Nenhum áudio capturado.", RED)
                 self._reativar_btn()
                 return
 
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-            filename_base = str(APP_DIR / f"meet_{timestamp}")
+            ts   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+            base = str(APP_DIR / f"meet_{ts}")
 
-            mp3_file = filename_base + ".mp3"
-            with open(mp3_file, "wb") as f:
-                for chunk in self._mp3_chunks:
-                    f.write(chunk)
-            logging.info("MP3 salvo: %s", mp3_file)
+            with open(base + ".mp3", "wb") as f:
+                for c in self._mp3_chunks:
+                    f.write(c)
+
+            self._stop_dot_animation()
+            m, s    = divmod(self._duracao_gravada, 60)
+            duracao = f"{m}min {s:02d}s"
 
             if self._transcricoes:
-                txt_file = filename_base + ".txt"
-                with open(txt_file, "w", encoding="utf-8") as f:
-                    f.write("\n\n".join(self._transcricoes))
-                logging.info("Transcrição salva: %s", txt_file)
-                self._set_status(f"Salvo: {Path(txt_file).name}", "#2ecc71", arquivo=txt_file)
+                txt   = base + ".txt"
+                texto = "\n\n".join(self._transcricoes)
+                with open(txt, "w", encoding="utf-8") as f:
+                    f.write(texto)
+                palavras = len(texto.split())
+                self._set_status(f"✓ {duracao} · {palavras:,} palavras — clique para abrir",
+                                 GREEN, arquivo=txt)
             else:
-                self._set_status(f"MP3 salvo (sem transcrição): {Path(mp3_file).name}", "#2ecc71", arquivo=mp3_file)
+                mp3 = base + ".mp3"
+                self._set_status(f"✓ {duracao} · MP3 salvo — clique para abrir",
+                                 GREEN, arquivo=mp3)
 
         except Exception as e:
             logging.error("Erro em _finalizar: %s", e, exc_info=True)
-            self._set_status(f"Erro: {e}", "#e74c3c")
+            self._stop_dot_animation()
+            self._set_status(f"Erro: {e}", RED)
         finally:
             self._reativar_btn()
 
-    def _set_status(self, msg, color="#888888", arquivo=None):
+    # ── helpers de UI ─────────────────────────────────────────────────────────
+
+    def _set_status(self, msg, color=None, arquivo=None):
         self._ultimo_arquivo = arquivo
         cursor = "hand2" if arquivo else "arrow"
-        self.root.after(0, lambda: self.lbl_status.config(text=msg, fg=color, cursor=cursor))
+        fg     = color or TEXT_DIM
+        font   = ctk.CTkFont(size=12, underline=True) if arquivo else ctk.CTkFont(size=12)
+        self.root.after(0, lambda: self.lbl_status.configure(
+            text=msg, text_color=fg, cursor=cursor, font=font))
 
-    def _abrir_arquivo(self, _event=None):
+    def _abrir_arquivo(self, _e=None):
         if self._ultimo_arquivo and Path(self._ultimo_arquivo).exists():
             os.startfile(self._ultimo_arquivo)
 
     def _reativar_btn(self):
-        self.root.after(0, lambda: self.btn.config(state="normal"))
+        self.root.after(0, lambda: self.btn.configure(
+            state="normal", fg_color=RED, hover_color="#c03030",
+            text_color=("white", "white"), text="● Gravar"
+        ))
 
     def fechar(self):
         self.stop_event.set()
+        self.root.after(100, self._shutdown)
+
+    def _shutdown(self):
         self.p.terminate()
         self.root.destroy()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = MemoryMeet(root)
-    root.protocol("WM_DELETE_WINDOW", app.fechar)
-    root.mainloop()
+    try:
+        root = ctk.CTk()
+        app  = MemoryMeet(root)
+        root.protocol("WM_DELETE_WINDOW", app.fechar)
+        root.mainloop()
+    except Exception as e:
+        import traceback
+        crash_log = Path.home() / "Documents" / "MemoryMeet" / "crash.log"
+        with open(crash_log, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*50}\n")
+            traceback.print_exc(file=f)
+        raise
