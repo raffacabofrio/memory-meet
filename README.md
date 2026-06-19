@@ -1,5 +1,9 @@
 # MemoryMeet
 
+<p align="center">
+  <img src="assets/logo.png" alt="MemoryMeet" width="280"/>
+</p>
+
 Memory fades. Conversations matter.
 
 MemoryMeet is a lightweight, open-source meeting recorder and transcription tool that helps you preserve discussions exactly as they happened.
