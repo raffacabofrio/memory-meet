@@ -17,7 +17,16 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-APP_DIR = Path.home() / "Documents" / "MemoryMeet"
+def _get_documents_dir() -> Path:
+    try:
+        import ctypes, ctypes.wintypes
+        buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+        ctypes.windll.shell32.SHGetFolderPathW(0, 5, 0, 0, buf)  # CSIDL_PERSONAL
+        return Path(buf.value)
+    except Exception:
+        return Path.home() / "Documents"
+
+APP_DIR = _get_documents_dir() / "MemoryMeet"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 load_dotenv(Path(__file__).parent / ".env")
