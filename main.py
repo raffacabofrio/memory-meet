@@ -29,7 +29,7 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 2
 MP3_BITRATE = 128
-CHUNK_MINUTOS = 20  # ~18 MB em MP3 128kbps — seguro abaixo do limite de 25 MB da API
+CHUNK_SEGUNDOS = 5 * 60  # processa um pedaço a cada 5 min durante a gravação
 
 
 def mix_frames(frames_a, frames_b):
@@ -60,12 +60,17 @@ class MemoryMeet:
         self.root.resizable(False, False)
         self.root.geometry("300x200")
 
+        icon = Path(__file__).parent / "assets" / "MemoryMeet.ico"
+        if icon.exists():
+            self.root.iconbitmap(str(icon))
+
         self.gravando = False
         self.stop_event = threading.Event()
         self.start_time = None
         self.timer_job = None
         self._thread_mic = None
         self._thread_sys = None
+        self._ultimo_arquivo = None
 
         self.p = pyaudio.PyAudio()
         try:
@@ -91,9 +96,10 @@ class MemoryMeet:
 
         self.lbl_status = tk.Label(
             self.root, text="Pronto", font=("Segoe UI", 11),
-            bg="#1e1e1e", fg="#888888"
+            bg="#1e1e1e", fg="#888888", cursor="arrow"
         )
         self.lbl_status.pack(pady=(4, 0))
+        self.lbl_status.bind("<Button-1>", self._abrir_arquivo)
 
         self.btn = tk.Button(
             self.root, text="● Gravar", font=("Segoe UI", 13, "bold"),
@@ -117,9 +123,13 @@ class MemoryMeet:
         self.stop_event.clear()
         self.mic_frames = []
         self.sys_frames = []
+        self._mp3_chunks = []
+        self._transcricoes = []
+        self._chunk_index = 0
+        self._ultimo_arquivo = None
 
         self.btn.config(text="■ Parar", bg="#555555")
-        self.lbl_status.config(text="Gravando...", fg="#e74c3c")
+        self.lbl_status.config(text="Gravando...", fg="#e74c3c", cursor="arrow")
 
         self.start_time = time.time()
         self._tick()
@@ -129,17 +139,15 @@ class MemoryMeet:
         self._thread_sys = threading.Thread(target=self._record_system, daemon=True)
         self._thread_mic.start()
         self._thread_sys.start()
+        threading.Thread(target=self._chunk_loop, daemon=True).start()
 
     def parar(self):
         self.gravando = False
         self.stop_event.set()
         if self.timer_job:
             self.root.after_cancel(self.timer_job)
-
         self.btn.config(state="disabled", text="● Gravar", bg="#c0392b")
-        self.lbl_status.config(text="Processando...", fg="#f39c12")
-
-        threading.Thread(target=self._processar, daemon=True).start()
+        self.lbl_status.config(text="Finalizando...", fg="#f39c12", cursor="arrow")
 
     def _tick(self):
         if self.gravando:
@@ -160,7 +168,6 @@ class MemoryMeet:
             logging.info("Mic encerrado. Frames: %d", len(self.mic_frames))
         except Exception as e:
             logging.error("Erro mic: %s", e, exc_info=True)
-            self._set_status(f"Erro mic: {e}", "#e74c3c")
 
     def _record_system(self):
         try:
@@ -178,87 +185,106 @@ class MemoryMeet:
             logging.info("Sistema encerrado. Frames: %d", len(self.sys_frames))
         except Exception as e:
             logging.error("Erro sistema: %s", e, exc_info=True)
-            self._set_status(f"Erro sistema: {e}", "#e74c3c")
 
-    def _processar(self):
-        for t in (self._thread_mic, self._thread_sys):
-            if t:
-                t.join(timeout=10)
+    def _swap_frames(self):
+        # Troca atômica — recording threads passam a escrever na nova lista vazia
+        mic = self.mic_frames
+        sys = self.sys_frames
+        self.mic_frames = []
+        self.sys_frames = []
+        return mic, sys
 
+    def _chunk_loop(self):
+        while True:
+            parou = self.stop_event.wait(timeout=CHUNK_SEGUNDOS)
+
+            if parou:
+                # Aguarda threads de gravação terminarem antes do chunk final
+                for t in (self._thread_mic, self._thread_sys):
+                    if t:
+                        t.join(timeout=10)
+
+            mic, sys = self._swap_frames()
+
+            if mic or sys:
+                self._chunk_index += 1
+                label = "final" if parou else f"{self._chunk_index}"
+                self._processar_chunk(mic, sys, label)
+
+            if parou:
+                break
+
+        self._finalizar()
+
+    def _processar_chunk(self, mic, sys, label):
         try:
-            if not self.mic_frames and not self.sys_frames:
-                self._set_status("Nenhum áudio capturado.", "#e74c3c")
-                self._reativar_btn()
+            if mic and sys:
+                audio = mix_frames(mic, sys)
+            elif mic:
+                audio = np.concatenate(mic)
+            else:
+                audio = np.concatenate(sys)
+
+            logging.info("Chunk %s — mixing. Samples: %d", label, len(audio))
+            mp3 = audio_para_mp3(audio, self.rate)
+            self._mp3_chunks.append(mp3)
+            logging.info("Chunk %s — MP3 pronto (%.1f MB)", label, len(mp3) / 1024 / 1024)
+
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
                 return
 
-            if self.mic_frames and self.sys_frames:
-                audio = mix_frames(self.mic_frames, self.sys_frames)
-            elif self.mic_frames:
-                audio = np.concatenate(self.mic_frames)
-            else:
-                audio = np.concatenate(self.sys_frames)
-
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-            filename_base = str(APP_DIR / f"meet_{timestamp}")
-
-            self._set_status("Convertendo para MP3...", "#f39c12")
-            logging.info("Convertendo para MP3. Samples: %d", len(audio))
-            mp3 = audio_para_mp3(audio, self.rate)
-            mp3_file = filename_base + ".mp3"
-            with open(mp3_file, "wb") as f:
-                f.write(mp3)
-            logging.info("MP3 salvo: %s (%.1f MB)", mp3_file, len(mp3) / 1024 / 1024)
-
-            self._set_status("Transcrevendo...", "#f39c12")
-            try:
-                txt_file = self._transcrever(audio, filename_base)
-                if txt_file:
-                    logging.info("Transcrição concluída: %s", txt_file)
-                    self._set_status(f"Salvo: {Path(txt_file).name}", "#2ecc71")
-                else:
-                    self._set_status(f"MP3 salvo (sem transcrição): {Path(mp3_file).name}", "#2ecc71")
-            except Exception as e:
-                logging.error("Transcrição falhou: %s", e, exc_info=True)
-                self._set_status(f"Transcrição falhou: {e}", "#e74c3c")
-
-        except Exception as e:
-            logging.error("Erro em _processar: %s", e, exc_info=True)
-            self._set_status(f"Erro: {e}", "#e74c3c")
-        finally:
-            self._reativar_btn()
-
-    def _transcrever(self, audio, filename_base):
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            return None
-
-        client = OpenAI(api_key=api_key)
-        frames_por_chunk = self.rate * CHANNELS * 60 * CHUNK_MINUTOS
-        chunks = [audio[i:i + frames_por_chunk] for i in range(0, len(audio), frames_por_chunk)]
-
-        transcricoes = []
-        for i, chunk in enumerate(chunks):
-            if len(chunks) > 1:
-                self._set_status(f"Transcrevendo {i+1}/{len(chunks)}...", "#f39c12")
-            mp3 = audio_para_mp3(chunk, self.rate)
-            logging.info("Enviando chunk %d/%d para API (%.1f MB MP3)", i + 1, len(chunks),
-                         len(mp3) / 1024 / 1024)
+            client = OpenAI(api_key=api_key)
             resultado = client.audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe",
                 file=("audio.mp3", io.BytesIO(mp3)),
                 timeout=120,
             )
-            logging.info("Chunk %d/%d transcrito. Chars: %d", i + 1, len(chunks), len(resultado.text))
-            transcricoes.append(resultado.text)
+            self._transcricoes.append(resultado.text)
+            logging.info("Chunk %s — transcrito. Chars: %d", label, len(resultado.text))
 
-        texto = "\n\n".join(transcricoes)
-        txt_file = filename_base + ".txt"
-        with open(txt_file, "w", encoding="utf-8") as f:
-            f.write(texto)
-        return txt_file
+        except Exception as e:
+            logging.error("Erro no chunk %s: %s", label, e, exc_info=True)
 
-    def _set_status(self, msg, color="#888888"):
-        self.root.after(0, lambda: self.lbl_status.config(text=msg, fg=color))
+    def _finalizar(self):
+        try:
+            if not self._mp3_chunks:
+                self._set_status("Nenhum áudio capturado.", "#e74c3c")
+                self._reativar_btn()
+                return
+
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+            filename_base = str(APP_DIR / f"meet_{timestamp}")
+
+            mp3_file = filename_base + ".mp3"
+            with open(mp3_file, "wb") as f:
+                for chunk in self._mp3_chunks:
+                    f.write(chunk)
+            logging.info("MP3 salvo: %s", mp3_file)
+
+            if self._transcricoes:
+                txt_file = filename_base + ".txt"
+                with open(txt_file, "w", encoding="utf-8") as f:
+                    f.write("\n\n".join(self._transcricoes))
+                logging.info("Transcrição salva: %s", txt_file)
+                self._set_status(f"Salvo: {Path(txt_file).name}", "#2ecc71", arquivo=txt_file)
+            else:
+                self._set_status(f"MP3 salvo (sem transcrição): {Path(mp3_file).name}", "#2ecc71", arquivo=mp3_file)
+
+        except Exception as e:
+            logging.error("Erro em _finalizar: %s", e, exc_info=True)
+            self._set_status(f"Erro: {e}", "#e74c3c")
+        finally:
+            self._reativar_btn()
+
+    def _set_status(self, msg, color="#888888", arquivo=None):
+        self._ultimo_arquivo = arquivo
+        cursor = "hand2" if arquivo else "arrow"
+        self.root.after(0, lambda: self.lbl_status.config(text=msg, fg=color, cursor=cursor))
+
+    def _abrir_arquivo(self, _event=None):
+        if self._ultimo_arquivo and Path(self._ultimo_arquivo).exists():
+            os.startfile(self._ultimo_arquivo)
 
     def _reativar_btn(self):
         self.root.after(0, lambda: self.btn.config(state="normal"))
