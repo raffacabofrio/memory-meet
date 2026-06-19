@@ -4,3 +4,4 @@ lameenc
 python-dotenv
 openai
 customtkinter
+pillow

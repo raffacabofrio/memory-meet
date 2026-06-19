@@ -42,18 +42,19 @@ logging.basicConfig(
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-CHUNK         = 1024
-FORMAT        = pyaudio.paInt16
-CHANNELS      = 2
-MP3_BITRATE   = 128
+CHUNK          = 1024
+FORMAT         = pyaudio.paInt16
+CHANNELS       = 2
+MP3_BITRATE    = 128
 CHUNK_SEGUNDOS = 5 * 60
 
-BG      = "#1a1a2e"
-RED     = "#e05050"
-GREEN   = "#50c878"
-ORANGE  = "#f0a030"
+BG       = "#1a1a2e"
+RED      = "#e05050"
+GREEN    = "#50c878"
+ORANGE   = "#f0a030"
 TEXT_DIM = "#55557a"
-VU_W    = 220
+BLUE     = "#4a9eff"
+VU_W     = 220
 
 
 # ── áudio ─────────────────────────────────────────────────────────────────────
@@ -84,7 +85,7 @@ class MemoryMeet:
         self.root = root
         self.root.title("MemoryMeet")
         self.root.resizable(False, False)
-        self.root.geometry("320x260")
+        self.root.geometry("320x300")
         self.root.configure(fg_color=BG)
 
         icon = Path(__file__).parent / "assets" / "MemoryMeet.ico"
@@ -99,6 +100,8 @@ class MemoryMeet:
         self._thread_sys      = None
         self._ultimo_arquivo  = None
         self._duracao_gravada = 0
+        self._mp3_path        = None
+        self._txt_path        = None
 
         self.p = pyaudio.PyAudio()
         try:
@@ -113,60 +116,185 @@ class MemoryMeet:
 
         self._build_ui()
 
+    # ── build ──────────────────────────────────────────────────────────────────
+
     def _build_ui(self):
+        self._logo_img = self._load_logo()
+
+        # --- Tela Idle ---
+        self.frame_idle = ctk.CTkFrame(self.root, fg_color="transparent")
+
+        if self._logo_img:
+            ctk.CTkLabel(self.frame_idle, image=self._logo_img, text="").pack(pady=(32, 0))
+        else:
+            ctk.CTkLabel(self.frame_idle, text="MemoryMeet",
+                         font=ctk.CTkFont(size=24, weight="bold"),
+                         text_color="#e0e0f8").pack(pady=(50, 0))
+
+        # spacer elástico empurra o botão pro rodapé
+        ctk.CTkFrame(self.frame_idle, fg_color="transparent", height=0).pack(expand=True, fill="y")
+
+        self.btn_gravar = ctk.CTkButton(
+            self.frame_idle, text="● Gravar",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            width=200, height=50, corner_radius=25,
+            fg_color=RED, hover_color="#c03030",
+            command=self.iniciar
+        )
+        self.btn_gravar.pack(pady=(0, 32))
+
+        if self.loopback is None:
+            self.btn_gravar.configure(state="disabled")
+            ctk.CTkLabel(self.frame_idle, text="Erro: loopback não encontrado",
+                         text_color=RED, font=ctk.CTkFont(size=11)).pack()
+
+        # --- Tela Gravando ---
+        self.frame_recording = ctk.CTkFrame(self.root, fg_color="transparent")
+
         self.lbl_timer = ctk.CTkLabel(
-            self.root, text="00:00",
+            self.frame_recording, text="00:00",
             font=ctk.CTkFont(family="Courier", size=52, weight="bold"),
             text_color="#e0e0f8"
         )
         self.lbl_timer.pack(pady=(24, 0))
 
-        # VU meter — mantém Canvas para controle de cor dinâmica
         self.vu_canvas = tk.Canvas(
-            self.root, width=VU_W, height=5,
+            self.frame_recording, width=VU_W, height=5,
             bg="#13131f", highlightthickness=0
         )
         self.vu_canvas.pack(pady=(12, 0))
 
         self.lbl_status = ctk.CTkLabel(
-            self.root, text="Pronto",
-            font=ctk.CTkFont(size=12),
-            text_color=TEXT_DIM, cursor="arrow"
+            self.frame_recording, text="Gravando...",
+            font=ctk.CTkFont(size=12), text_color=RED
         )
         self.lbl_status.pack(pady=(10, 0))
-        self.lbl_status.bind("<Button-1>", self._abrir_arquivo)
 
         self.spinner = ctk.CTkProgressBar(
-            self.root, width=160, height=4,
+            self.frame_recording, width=160, height=4,
             mode="indeterminate", indeterminate_speed=1.2,
             progress_color=ORANGE, fg_color="#2a2a3a"
         )
         self.spinner.pack(pady=(6, 0))
         self.spinner.pack_forget()
 
-        self.btn = ctk.CTkButton(
-            self.root,
-            text="● Gravar",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            width=200, height=50,
-            corner_radius=25,
-            fg_color=RED,
-            hover_color="#c03030",
-            command=self.toggle
-        )
-        self.btn.pack(pady=(20, 0))
+        ctk.CTkFrame(self.frame_recording, fg_color="transparent", height=0).pack(expand=True, fill="y")
 
-        if self.loopback is None:
-            self._set_status("Erro: loopback não encontrado", RED)
-            self.btn.configure(state="disabled")
+        self.btn_parar = ctk.CTkButton(
+            self.frame_recording, text="■ Parar",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            width=200, height=50, corner_radius=25,
+            fg_color="#333344", hover_color="#444455",
+            command=self.parar
+        )
+        self.btn_parar.pack(pady=(0, 32))
+
+        # --- Tela Resultado ---
+        self.frame_result = ctk.CTkFrame(self.root, fg_color="transparent")
+
+        # link no rodapé — packed primeiro com side="bottom"
+        self.lbl_nova = ctk.CTkLabel(
+            self.frame_result, text="Nova gravação →",
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_DIM, cursor="hand2"
+        )
+        self.lbl_nova.pack(side="bottom", pady=(0, 32))
+        self.lbl_nova.bind("<Button-1>", lambda _: self._show_idle())
+
+        # spacer inferior — empurra conteúdo pra cima
+        ctk.CTkFrame(self.frame_result, fg_color="transparent", height=0).pack(
+            side="bottom", expand=True, fill="y")
+
+        # spacer superior — empurra conteúdo pra baixo (juntos, centralizam)
+        ctk.CTkFrame(self.frame_result, fg_color="transparent", height=0).pack(
+            side="top", expand=True, fill="y")
+
+        # conteúdo central
+        self.doc_canvas = tk.Canvas(
+            self.frame_result, width=56, height=70,
+            bg=BG, highlightthickness=0
+        )
+        self.doc_canvas.pack(pady=(0, 10))
+        self.doc_canvas.bind("<Button-1>", self._abrir_arquivo)
+        self.doc_canvas.configure(cursor="hand2")
+        self._draw_doc_icon()
+
+        self.lbl_resultado = ctk.CTkLabel(
+            self.frame_result, text="",
+            font=ctk.CTkFont(size=13, underline=True),
+            text_color=BLUE, cursor="hand2"
+        )
+        self.lbl_resultado.pack()
+        self.lbl_resultado.bind("<Button-1>", self._abrir_arquivo)
+
+        self.lbl_preview = ctk.CTkLabel(
+            self.frame_result, text="",
+            font=ctk.CTkFont(size=10),
+            text_color=TEXT_DIM, wraplength=270, justify="left"
+        )
+        self.lbl_preview.pack(pady=(10, 0), padx=20)
+
+
+        self._show_idle()
+
+    def _load_logo(self):
+        try:
+            from PIL import Image
+            logo_path = Path(__file__).parent / "assets" / "logo.png"
+            if not logo_path.exists():
+                return None
+            img = Image.open(logo_path).convert("RGBA").resize((160, 160), Image.LANCZOS)
+            return ctk.CTkImage(light_image=img, dark_image=img, size=(160, 160))
+        except Exception as e:
+            logging.warning("Logo não carregado: %s", e)
+        return None
+
+    def _draw_doc_icon(self):
+        c, w, h, fold = self.doc_canvas, 56, 70, 14
+        c.create_polygon(0, 0, w-fold, 0, w, fold, w, h, 0, h,
+                         fill="#e8e8f4", outline="#8888aa", width=1)
+        c.create_polygon(w-fold, 0, w, fold, w-fold, fold,
+                         fill="#c0c0d8", outline="#8888aa", width=1)
+        for y in range(h//3, h-6, 11):
+            c.create_line(9, y, w-9, y, fill="#9999bb", width=2)
+
+    # ── navegação entre telas ──────────────────────────────────────────────────
+
+    def _show_idle(self):
+        self.frame_recording.pack_forget()
+        self.frame_result.pack_forget()
+        self.frame_idle.pack(fill="both", expand=True)
+
+    def _show_recording(self):
+        self.frame_idle.pack_forget()
+        self.frame_result.pack_forget()
+        self.lbl_status.configure(text="Gravando...", text_color=RED,
+                                  font=ctk.CTkFont(size=12))
+        self.frame_recording.pack(fill="both", expand=True)
+
+    def _show_result(self):
+        arquivo = str(self._txt_path) if self._txt_path and self._txt_path.exists() \
+                  else str(self._mp3_path)
+        self._ultimo_arquivo = arquivo
+
+        self.lbl_resultado.configure(text=Path(arquivo).name)
+
+        preview = ""
+        if self._txt_path and self._txt_path.exists():
+            try:
+                text = self._txt_path.read_text(encoding="utf-8")
+                preview = text[:160].strip()
+                if len(text) > 160:
+                    preview += "…"
+            except Exception:
+                pass
+        self.lbl_preview.configure(text=preview)
+
+        self.frame_idle.pack_forget()
+        self.frame_recording.pack_forget()
+        self.frame_result.pack(fill="both", expand=True)
 
     # ── controle ──────────────────────────────────────────────────────────────
-
-    def toggle(self):
-        if self.gravando:
-            self.parar()
-        else:
-            self.iniciar()
 
     def iniciar(self):
         self.gravando = True
@@ -180,9 +308,7 @@ class MemoryMeet:
         self._mp3_path = APP_DIR / f"meet_{ts}.mp3"
         self._txt_path = APP_DIR / f"meet_{ts}.txt"
 
-        self.btn.configure(text="■ Parar", fg_color="#333344", hover_color="#444455")
-        self._set_status("Gravando...", RED)
-
+        self._show_recording()
         self.start_time = time.time()
         self._tick()
         self._vu_tick()
@@ -200,9 +326,8 @@ class MemoryMeet:
         self.stop_event.set()
         if self.timer_job:
             self.root.after_cancel(self.timer_job)
-        self.btn.configure(text="● Gravar", fg_color="#2a2a3a",
-                           hover_color="#2a2a3a", text_color="#44445a",
-                           state="disabled")
+        self.btn_parar.configure(fg_color="#2a2a3a", hover_color="#2a2a3a",
+                                 text_color="#44445a", state="disabled")
         self._vu_clear()
         self.root.after(0, lambda: self._start_spinner("Finalizando", ORANGE))
 
@@ -233,11 +358,12 @@ class MemoryMeet:
     def _vu_clear(self):
         self.vu_canvas.delete("all")
 
-    # ── dot animation ─────────────────────────────────────────────────────────
+    # ── spinner ───────────────────────────────────────────────────────────────
 
     def _start_spinner(self, msg, color):
-        self._set_status(msg, color)
-        self.spinner.pack(pady=(6, 0))
+        self.lbl_status.configure(text=msg, text_color=color, font=ctk.CTkFont(size=12))
+        self.btn_parar.pack_forget()
+        self.spinner.pack(after=self.lbl_status, pady=(70, 0))
         self.spinner.start()
 
     def _stop_spinner(self):
@@ -330,52 +456,33 @@ class MemoryMeet:
             logging.error("Erro chunk %s: %s", label, e, exc_info=True)
 
     def _flash_status(self, msg, color, restore_after_ms=3000):
-        self.lbl_status.configure(text=msg, text_color=color, cursor="arrow",
-                                  font=ctk.CTkFont(size=12))
+        self.lbl_status.configure(text=msg, text_color=color, font=ctk.CTkFont(size=12))
         self.root.after(restore_after_ms,
-                        lambda: self._set_status("Gravando...", RED) if self.gravando else None)
+                        lambda: self.lbl_status.configure(text="Gravando...", text_color=RED)
+                        if self.gravando else None)
 
     def _finalizar(self):
         try:
-            if not self._mp3_path.exists():
+            if not self._mp3_path or not self._mp3_path.exists():
                 self._stop_spinner()
-                self._set_status("Nenhum áudio capturado.", RED)
-                self._reativar_btn()
+                self.lbl_status.configure(text="Nenhum áudio capturado.", text_color=RED)
+                self.btn_parar.configure(state="normal", fg_color="#333344",
+                                         hover_color="#444455", text_color=("white", "white"))
                 return
 
             self._stop_spinner()
-
-            if self._txt_path.exists():
-                self._set_status(f"📄 {self._txt_path.name}", "#4a9eff", arquivo=str(self._txt_path))
-            else:
-                self._set_status(f"📄 {self._mp3_path.name}", "#4a9eff", arquivo=str(self._mp3_path))
+            self.root.after(0, self._show_result)
 
         except Exception as e:
             logging.error("Erro em _finalizar: %s", e, exc_info=True)
             self._stop_spinner()
-            self._set_status(f"Erro: {e}", RED)
-        finally:
-            self._reativar_btn()
+            self.lbl_status.configure(text=f"Erro: {e}", text_color=RED)
 
-    # ── helpers de UI ─────────────────────────────────────────────────────────
-
-    def _set_status(self, msg, color=None, arquivo=None):
-        self._ultimo_arquivo = arquivo
-        cursor = "hand2" if arquivo else "arrow"
-        fg     = color or TEXT_DIM
-        font   = ctk.CTkFont(size=12, underline=True) if arquivo else ctk.CTkFont(size=12)
-        self.root.after(0, lambda: self.lbl_status.configure(
-            text=msg, text_color=fg, cursor=cursor, font=font))
+    # ── helpers ───────────────────────────────────────────────────────────────
 
     def _abrir_arquivo(self, _e=None):
         if self._ultimo_arquivo and Path(self._ultimo_arquivo).exists():
             os.startfile(self._ultimo_arquivo)
-
-    def _reativar_btn(self):
-        self.root.after(0, lambda: self.btn.configure(
-            state="normal", fg_color=RED, hover_color="#c03030",
-            text_color=("white", "white"), text="● Gravar"
-        ))
 
     def fechar(self):
         self.stop_event.set()
@@ -394,7 +501,7 @@ if __name__ == "__main__":
         root.mainloop()
     except Exception as e:
         import traceback
-        crash_log = Path.home() / "Documents" / "MemoryMeet" / "crash.log"
+        crash_log = APP_DIR / "crash.log"
         with open(crash_log, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*50}\n")
             traceback.print_exc(file=f)
