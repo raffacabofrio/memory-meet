@@ -1,0 +1,5 @@
+pyaudiowpatch
+numpy
+lameenc
+python-dotenv
+openai
