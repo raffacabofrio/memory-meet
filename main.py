@@ -171,12 +171,14 @@ class MemoryMeet:
     def iniciar(self):
         self.gravando = True
         self.stop_event.clear()
-        self.mic_frames    = []
-        self.sys_frames    = []
-        self._mp3_chunks   = []
-        self._transcricoes = []
-        self._chunk_index  = 0
+        self.mic_frames   = []
+        self.sys_frames   = []
+        self._chunk_index = 0
         self._ultimo_arquivo = None
+
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+        self._mp3_path = APP_DIR / f"meet_{ts}.mp3"
+        self._txt_path = APP_DIR / f"meet_{ts}.txt"
 
         self.btn.configure(text="■ Parar", fg_color="#333344", hover_color="#444455")
         self._set_status("Gravando...", RED)
@@ -300,8 +302,10 @@ class MemoryMeet:
 
             logging.info("Chunk %s — samples: %d", label, len(audio))
             mp3 = audio_para_mp3(audio, self.rate)
-            self._mp3_chunks.append(mp3)
             logging.info("Chunk %s — MP3 %.1f MB", label, len(mp3) / 1024 / 1024)
+
+            with open(self._mp3_path, "ab") as f:
+                f.write(mp3)
 
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
@@ -312,8 +316,12 @@ class MemoryMeet:
                 file=("audio.mp3", io.BytesIO(mp3)),
                 timeout=120,
             )
-            self._transcricoes.append(resultado.text)
             logging.info("Chunk %s — %d chars", label, len(resultado.text))
+
+            with open(self._txt_path, "a", encoding="utf-8") as f:
+                if self._chunk_index > 1:
+                    f.write("\n\n")
+                f.write(resultado.text)
 
             if not is_final and self.gravando:
                 self._flash_status("✓ trecho processado", GREEN, restore_after_ms=3000)
@@ -322,7 +330,6 @@ class MemoryMeet:
             logging.error("Erro chunk %s: %s", label, e, exc_info=True)
 
     def _flash_status(self, msg, color, restore_after_ms=3000):
-        self._stop_dot_animation()
         self.lbl_status.configure(text=msg, text_color=color, cursor="arrow",
                                   font=ctk.CTkFont(size=12))
         self.root.after(restore_after_ms,
@@ -330,32 +337,18 @@ class MemoryMeet:
 
     def _finalizar(self):
         try:
-            if not self._mp3_chunks:
+            if not self._mp3_path.exists():
                 self._stop_spinner()
                 self._set_status("Nenhum áudio capturado.", RED)
                 self._reativar_btn()
                 return
 
-            ts   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-            base = str(APP_DIR / f"meet_{ts}")
-
-            with open(base + ".mp3", "wb") as f:
-                for c in self._mp3_chunks:
-                    f.write(c)
-
             self._stop_spinner()
-            m, s    = divmod(self._duracao_gravada, 60)
-            duracao = f"{m}min {s:02d}s"
 
-            if self._transcricoes:
-                txt   = base + ".txt"
-                texto = "\n\n".join(self._transcricoes)
-                with open(txt, "w", encoding="utf-8") as f:
-                    f.write(texto)
-                self._set_status(f"📄 {Path(txt).name}", "#4a9eff", arquivo=txt)
+            if self._txt_path.exists():
+                self._set_status(f"📄 {self._txt_path.name}", "#4a9eff", arquivo=str(self._txt_path))
             else:
-                mp3 = base + ".mp3"
-                self._set_status(f"📄 {Path(mp3).name}", "#4a9eff", arquivo=mp3)
+                self._set_status(f"📄 {self._mp3_path.name}", "#4a9eff", arquivo=str(self._mp3_path))
 
         except Exception as e:
             logging.error("Erro em _finalizar: %s", e, exc_info=True)
