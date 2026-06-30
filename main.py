@@ -11,6 +11,7 @@ import datetime
 import os
 import io
 import time
+import base64
 import logging
 import lameenc
 from pathlib import Path
@@ -47,6 +48,9 @@ FORMAT         = pyaudio.paInt16
 CHANNELS       = 2
 MP3_BITRATE    = 128
 CHUNK_SEGUNDOS = 5 * 60
+TRANSCRIBE_MODEL = "gpt-4o-transcribe-diarize"
+REF_ALVO_SEG    = 8         # duração enviada da referência de voz (limite da API: 2-10s)
+REF_MIN_ENERGIA = 150       # piso de energia (mean abs int16) p/ considerar que o canal tem fala (não ancorar silêncio)
 
 BG       = "#1a1a2e"
 RED      = "#e05050"
@@ -78,6 +82,38 @@ def audio_para_mp3(audio, rate):
     return enc.encode(audio.tobytes()) + enc.flush()
 
 
+def best_speech_window(audio, win_len, step):
+    """Retorna (trecho, energia) da janela de maior energia — provável fala mais limpa do canal."""
+    a = np.abs(audio.astype(np.int32))
+    if len(audio) <= win_len:
+        return audio, (float(a.mean()) if len(a) else 0.0)
+    best_start, best_energy = 0, -1.0
+    for start in range(0, len(audio) - win_len + 1, step):
+        energy = float(a[start:start + win_len].mean())
+        if energy > best_energy:
+            best_energy, best_start = energy, start
+    return audio[best_start:best_start + win_len], best_energy
+
+
+def _seg_attr(seg, key, default=""):
+    return seg.get(key, default) if isinstance(seg, dict) else getattr(seg, key, default)
+
+
+def format_segments(segments):
+    """diarized_json -> texto com [speaker] por turno, mesclando turnos consecutivos do mesmo falante."""
+    blocos = []
+    for seg in segments:
+        speaker = _seg_attr(seg, "speaker", "") or "SPEAKER"
+        text = (_seg_attr(seg, "text", "") or "").strip()
+        if not text:
+            continue
+        if blocos and blocos[-1][0] == speaker:
+            blocos[-1][1] += " " + text
+        else:
+            blocos.append([speaker, text])
+    return "\n\n".join(f"[{spk}] {txt}" for spk, txt in blocos)
+
+
 # ── app ───────────────────────────────────────────────────────────────────────
 
 class MemoryMeet:
@@ -85,7 +121,7 @@ class MemoryMeet:
         self.root = root
         self.root.title("MemoryMeet")
         self.root.resizable(False, False)
-        self.root.geometry("320x300")
+        self.root.geometry("320x360")
         self.root.configure(fg_color=BG)
 
         icon = Path(__file__).parent / "assets" / "MemoryMeet.ico"
@@ -98,10 +134,13 @@ class MemoryMeet:
         self.timer_job        = None
         self._thread_mic      = None
         self._thread_sys      = None
+        self._thread_keepalive = None
         self._ultimo_arquivo  = None
         self._duracao_gravada = 0
         self._mp3_path        = None
         self._txt_path        = None
+        self._ref_mic         = None
+        self._ref_sys         = None
 
         self.p = pyaudio.PyAudio()
         try:
@@ -303,6 +342,8 @@ class MemoryMeet:
         self.sys_frames   = []
         self._chunk_index = 0
         self._ultimo_arquivo = None
+        self._ref_mic     = None
+        self._ref_sys     = None
 
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
         self._mp3_path = APP_DIR / f"meet_{ts}.mp3"
@@ -314,6 +355,10 @@ class MemoryMeet:
         self._vu_tick()
 
         logging.info("Gravação iniciada")
+        # keep-alive PRIMEIRO: mantém a saída ativa pro loopback BT não suspender no silêncio
+        # (senão o canal do sistema perde frames e dessincroniza do mic — vira mix sobreposto)
+        self._thread_keepalive = threading.Thread(target=self._keep_output_alive, daemon=True)
+        self._thread_keepalive.start()
         self._thread_mic = threading.Thread(target=self._record_mic, daemon=True)
         self._thread_sys = threading.Thread(target=self._record_system, daemon=True)
         self._thread_mic.start()
@@ -372,6 +417,21 @@ class MemoryMeet:
 
     # ── gravação ──────────────────────────────────────────────────────────────
 
+    def _keep_output_alive(self):
+        """Toca silêncio inaudível contínuo na saída padrão enquanto grava. Mantém o endpoint
+           ativo pro loopback WASAPI (sobretudo Bluetooth) não suspender durante o silêncio —
+           o que faria o canal do sistema perder frames e dessincronizar do mic."""
+        try:
+            out = self.p.open(format=FORMAT, channels=CHANNELS, rate=self.rate,
+                              output=True, frames_per_buffer=CHUNK)
+            silencio = np.zeros(CHUNK * CHANNELS, dtype=np.int16).tobytes()
+            while not self.stop_event.is_set():
+                out.write(silencio)               # bloqueia no ritmo real → mantém a saída viva
+            out.stop_stream(); out.close()
+            logging.info("Keep-alive de saída encerrado")
+        except Exception as e:
+            logging.error("Erro keep-alive (gravação segue sem ele): %s", e, exc_info=True)
+
     def _record_mic(self):
         try:
             stream = self.p.open(format=FORMAT, channels=CHANNELS, rate=self.rate,
@@ -420,6 +480,28 @@ class MemoryMeet:
                 break
         self._finalizar()
 
+    def _build_reference(self, frames):
+        """Acha os ~8s de fala mais limpa do canal (varre tudo, pega a janela de maior energia) e
+           devolve como MP3 data URL. None se o canal não tiver fala suficiente (não ancora silêncio).
+           MP3, não WAV cru: cada 'part' do multipart tem limite de 1024KB; WAV de 8s estéreo/48kHz
+           (~1.5MB) estoura, MP3 128kbps de 8s ~128KB."""
+        try:
+            if not frames:
+                return None
+            audio = np.concatenate(frames)
+            spc = self.rate * CHANNELS                 # samples por segundo (stereo interleaved)
+            if len(audio) < 2 * spc:                   # menos de 2s não serve (limite da API)
+                return None
+            win = min(REF_ALVO_SEG * spc, len(audio))
+            clip, energia = best_speech_window(audio, win, step=spc)
+            if energia < REF_MIN_ENERGIA:              # só silêncio/ruído — não ancora
+                return None
+            mp3 = audio_para_mp3(clip, self.rate)
+            return "data:audio/mp3;base64," + base64.b64encode(mp3).decode("ascii")
+        except Exception as e:
+            logging.error("Falha ao montar referência: %s", e, exc_info=True)
+            return None
+
     def _processar_chunk(self, mic, sys, is_final=False):
         label = "final" if is_final else str(self._chunk_index)
         try:
@@ -437,17 +519,45 @@ class MemoryMeet:
             if not api_key:
                 return
 
-            resultado = OpenAI(api_key=api_key).audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=("audio.mp3", io.BytesIO(mp3)),
-                timeout=120,
-            )
-            logging.info("Chunk %s — %d chars", label, len(resultado.text))
+            # Ancora os dois falantes: referência limpa do canal de cada um (mic=Raffa,
+            # sistema=Interlocutor), montada no primeiro chunk com fala suficiente e reusada
+            # nos seguintes — estabiliza os rótulos entre chunks (o diarize renumera por chamada).
+            if self._ref_mic is None:
+                self._ref_mic = self._build_reference(mic)
+                if self._ref_mic:
+                    logging.info("Chunk %s — referência [Raffa] montada", label)
+            if self._ref_sys is None:
+                self._ref_sys = self._build_reference(sys)
+                if self._ref_sys:
+                    logging.info("Chunk %s — referência [Interlocutor] montada", label)
 
-            with open(self._txt_path, "a", encoding="utf-8") as f:
-                if self._chunk_index > 1:
-                    f.write("\n\n")
-                f.write(resultado.text)
+            nomes, refs = [], []
+            if self._ref_mic:
+                nomes.append("Raffa");        refs.append(self._ref_mic)
+            if self._ref_sys:
+                nomes.append("Interlocutor"); refs.append(self._ref_sys)
+            extra = {}
+            if refs:
+                extra["known_speaker_names"] = nomes
+                extra["known_speaker_references"] = refs
+
+            resultado = OpenAI(api_key=api_key).audio.transcriptions.create(
+                model=TRANSCRIBE_MODEL,
+                file=("audio.mp3", io.BytesIO(mp3)),
+                response_format="diarized_json",
+                chunking_strategy="auto",
+                extra_body=extra,
+                timeout=180,
+            )
+            segments = getattr(resultado, "segments", None) or []
+            texto = format_segments(segments)
+            logging.info("Chunk %s — %d segmentos, %d chars", label, len(segments), len(texto))
+
+            if texto:
+                with open(self._txt_path, "a", encoding="utf-8") as f:
+                    if self._chunk_index > 1:
+                        f.write("\n\n")
+                    f.write(texto)
 
             if not is_final and self.gravando:
                 self._flash_status("✓ trecho processado", GREEN, restore_after_ms=3000)
