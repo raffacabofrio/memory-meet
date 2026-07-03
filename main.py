@@ -9,14 +9,14 @@ import numpy as np
 import threading
 import datetime
 import os
-import io
 import time
-import base64
 import logging
 import lameenc
 from pathlib import Path
 from dotenv import load_dotenv
-from openai import OpenAI
+
+from transcribers import get_transcriber
+from transcribers.base import SpeakerRef
 
 def _get_documents_dir() -> Path:
     try:
@@ -48,8 +48,7 @@ FORMAT         = pyaudio.paInt16
 CHANNELS       = 2
 MP3_BITRATE    = 128
 CHUNK_SEGUNDOS = 5 * 60
-TRANSCRIBE_MODEL = "gpt-4o-transcribe-diarize"
-REF_ALVO_SEG    = 8         # duração enviada da referência de voz (limite da API: 2-10s)
+REF_ALVO_SEG    = 8         # duração da janela de referência de voz (2-10s)
 REF_MIN_ENERGIA = 150       # piso de energia (mean abs int16) p/ considerar que o canal tem fala (não ancorar silêncio)
 
 BG       = "#1a1a2e"
@@ -141,6 +140,7 @@ class MemoryMeet:
         self._txt_path        = None
         self._ref_mic         = None
         self._ref_sys         = None
+        self.transcriber      = get_transcriber()
 
         self.p = pyaudio.PyAudio()
         try:
@@ -482,22 +482,20 @@ class MemoryMeet:
 
     def _build_reference(self, frames):
         """Acha os ~8s de fala mais limpa do canal (varre tudo, pega a janela de maior energia) e
-           devolve como MP3 data URL. None se o canal não tiver fala suficiente (não ancora silêncio).
-           MP3, não WAV cru: cada 'part' do multipart tem limite de 1024KB; WAV de 8s estéreo/48kHz
-           (~1.5MB) estoura, MP3 128kbps de 8s ~128KB."""
+           devolve o clip cru (mesmo dtype/rate da captura). None se o canal não tiver fala
+           suficiente (não ancora silêncio). Cada transcriber decide como codificar/usar o clip."""
         try:
             if not frames:
                 return None
             audio = np.concatenate(frames)
             spc = self.rate * CHANNELS                 # samples por segundo (stereo interleaved)
-            if len(audio) < 2 * spc:                   # menos de 2s não serve (limite da API)
+            if len(audio) < 2 * spc:                   # menos de 2s não serve
                 return None
             win = min(REF_ALVO_SEG * spc, len(audio))
             clip, energia = best_speech_window(audio, win, step=spc)
             if energia < REF_MIN_ENERGIA:              # só silêncio/ruído — não ancora
                 return None
-            mp3 = audio_para_mp3(clip, self.rate)
-            return "data:audio/mp3;base64," + base64.b64encode(mp3).decode("ascii")
+            return clip
         except Exception as e:
             logging.error("Falha ao montar referência: %s", e, exc_info=True)
             return None
@@ -515,41 +513,25 @@ class MemoryMeet:
             with open(self._mp3_path, "ab") as f:
                 f.write(mp3)
 
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                return
-
             # Ancora os dois falantes: referência limpa do canal de cada um (mic=Raffa,
             # sistema=Interlocutor), montada no primeiro chunk com fala suficiente e reusada
             # nos seguintes — estabiliza os rótulos entre chunks (o diarize renumera por chamada).
             if self._ref_mic is None:
                 self._ref_mic = self._build_reference(mic)
-                if self._ref_mic:
+                if self._ref_mic is not None:
                     logging.info("Chunk %s — referência [Raffa] montada", label)
             if self._ref_sys is None:
                 self._ref_sys = self._build_reference(sys)
-                if self._ref_sys:
+                if self._ref_sys is not None:
                     logging.info("Chunk %s — referência [Interlocutor] montada", label)
 
-            nomes, refs = [], []
-            if self._ref_mic:
-                nomes.append("Raffa");        refs.append(self._ref_mic)
-            if self._ref_sys:
-                nomes.append("Interlocutor"); refs.append(self._ref_sys)
-            extra = {}
-            if refs:
-                extra["known_speaker_names"] = nomes
-                extra["known_speaker_references"] = refs
+            refs = []
+            if self._ref_mic is not None:
+                refs.append(SpeakerRef(name="Raffa", audio=self._ref_mic, rate=self.rate))
+            if self._ref_sys is not None:
+                refs.append(SpeakerRef(name="Interlocutor", audio=self._ref_sys, rate=self.rate))
 
-            resultado = OpenAI(api_key=api_key).audio.transcriptions.create(
-                model=TRANSCRIBE_MODEL,
-                file=("audio.mp3", io.BytesIO(mp3)),
-                response_format="diarized_json",
-                chunking_strategy="auto",
-                extra_body=extra,
-                timeout=180,
-            )
-            segments = getattr(resultado, "segments", None) or []
+            segments = self.transcriber.transcribe_and_diarize(audio, self.rate, refs)
             texto = format_segments(segments)
             logging.info("Chunk %s — %d segmentos, %d chars", label, len(segments), len(texto))
 

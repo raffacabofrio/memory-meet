@@ -4,6 +4,26 @@ Itens pendentes e ideias futuras. O mais maduro fica no topo.
 
 ---
 
+## 🟡 Migrar transcrição+diarização pra local (faster-whisper + pyannote.audio) — registrado 01/07/2026, implementação iniciada 03/07/2026
+
+**Status (03/07/2026):** camada `transcribers/` implementada e validada ponta a ponta — `TRANSCRIBER=openai|whisperx` no `.env`, WhisperX rodando 100% local (venv Python 3.12 dedicado, ver README). Testado com gravação real: transcrição correta, diarização funcionando com rótulo genérico (`SPEAKER_00`). **Pendente:** mapear `SPEAKER_00`/`01` pro nome real (Raffa/Interlocutor) via embedding de voz das referências ancoradas — pyannote já devolve `speaker_embeddings` prontos (`DiarizationPipeline(..., return_embeddings=True)`), falta só o casamento por similaridade. Também pendente decidir se vale resolver o cold start de ~3min pra carregar os modelos (hoje eager no `__init__`).
+
+**Justificativa do Raffa:** a API da OpenAI (`gpt-4o-transcribe-diarize`) está instável — **perdemos chunks inteiros em duas sessões diferentes** (hoje: chunk 3 da call ACT/BTG, timeout total após 2 retries; e a sessão da entrevista Nava/BMG também precisou de recuperação via reprocessamento do MP3). Além da instabilidade, um modelo local elimina custo por minuto.
+
+**Contexto técnico (da investigação de 01/07/2026):** o gargalo de hoje foi causado por uma combinação de (a) o modelo da OpenAI dar timeout de 180s repetidamente em chunks de ~5-6 min, e (b) o `_chunk_loop` em `main.py` ser síncrono — o timer do próximo chunk só recomeça depois que o anterior termina de processar (com todos os retries), o que faz um chunk lento inflar o próximo (cascata: 5min → 14min → timeout total). Ver sessão `sessions/2026-07-01 - microfone code22, gargalo memorymeet e entrevista act-btg.md` no repo `projeto-carreira-2026` para o diagnóstico completo (inclui proposta de fix incremental: paralelizar `_processar_chunk` e/ou reduzir `CHUNK_SEGUNDOS`, discussão ainda pendente).
+
+**Caminho de migração (levantado em conversa, não validado ainda):**
+- **faster-whisper** (ou `openai-whisper`) para transcrição local — CPU ou GPU, sem custo por minuto.
+- **pyannote.audio** para diarização — grátis, mas os modelos pretrained são "gated" no Hugging Face (aceitar licença + gerar token, sem custo).
+- **WhisperX** empacota os dois com alinhamento palavra-a-palavra — é o caminho mais direto pra reproduzir o que o app faz hoje, 100% local.
+
+**Trade-offs a validar antes de migrar:**
+- **Sem GPU dedicada neste notebook** (só Intel Graphics integrado, sem `nvidia-smi` — checado em 01/07/2026). `faster-whisper` roda razoável em CPU (modelo pequeno/médio + int8); `pyannote.audio` em CPU é mais lento que com GPU. **Não é bloqueio real:** a arquitetura já processa em chunks com antecedência (não é tempo real hoje, mesmo com a API da OpenAI), então o que importa é só não acumular atraso indefinidamente — mesmo critério que já vale pro bug do `_chunk_loop` síncrono acima. Raffa está otimista que CPU dá conta nesse regime.
+- A diarização por pyannote tende a ser um pouco menos estável em trocas rápidas de falante do que a abordagem atual (duas referências de voz ancoradas por canal, mic/sistema) — pode precisar adaptar a lógica de referência ancorada pro pyannote, não só trocar o modelo.
+- Não elimina o bug do `_chunk_loop` síncrono por si só — são dois problemas distintos (estabilidade da API vs. arquitetura de chunking); resolver um não resolve o outro automaticamente.
+
+---
+
 ## ✅ FEITO — Diarização (identificar quem fala) — 30/06/2026
 
 Implementado e **provado funcionando** end-to-end. O TXT agora sai com os falantes separados e nomeados:
