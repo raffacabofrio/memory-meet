@@ -52,6 +52,8 @@ CHANNELS       = 2
 MP3_BITRATE    = 128
 CHUNK_SEGUNDOS = 5 * 60
 WORKERS        = int(os.getenv("MEMORYMEET_WORKERS", "1"))  # N>1 exige transcriber thread-safe (ver processar_chunk)
+SPEAKER_MIC    = os.getenv("MEMORYMEET_SPEAKER", "Me")               # rótulo do canal do mic (você)
+SPEAKER_SYS    = os.getenv("MEMORYMEET_INTERLOCUTOR", "Interlocutor")  # rótulo do canal do sistema (o outro lado)
 REF_ALVO_SEG    = 8         # duração da janela de referência de voz (2-10s)
 REF_MIN_ENERGIA = 150       # piso de energia (mean abs int16) p/ considerar que o canal tem fala (não ancorar silêncio)
 
@@ -593,18 +595,18 @@ class MemoryMeet:
         if self._ref_mic is None:
             self._ref_mic = self._build_reference(mic)
             if self._ref_mic is not None:
-                logging.info("Referência [Raffa] montada")
+                logging.info("Referência [%s] montada", SPEAKER_MIC)
         if self._ref_sys is None:
             self._ref_sys = self._build_reference(sys)
             if self._ref_sys is not None:
-                logging.info("Referência [Interlocutor] montada")
+                logging.info("Referência [%s] montada", SPEAKER_SYS)
 
     def _speaker_refs(self):
         refs = []
         if self._ref_mic is not None:
-            refs.append(SpeakerRef(name="Raffa", audio=self._ref_mic, rate=self.rate))
+            refs.append(SpeakerRef(name=SPEAKER_MIC, audio=self._ref_mic, rate=self.rate))
         if self._ref_sys is not None:
-            refs.append(SpeakerRef(name="Interlocutor", audio=self._ref_sys, rate=self.rate))
+            refs.append(SpeakerRef(name=SPEAKER_SYS, audio=self._ref_sys, rate=self.rate))
         return tuple(refs)
 
     def _update_progress(self):

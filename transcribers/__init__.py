@@ -2,10 +2,10 @@ import os
 
 
 def get_transcriber():
-    """Lê TRANSCRIBER do .env (default: openai) e devolve a implementação correspondente.
-       Import lazy dentro de cada branch: quem usa 'openai' nunca carrega dependências
-       de outros transcribers (ex.: torch/whisperx)."""
-    nome = os.getenv("TRANSCRIBER", "openai").lower()
+    """Lê TRANSCRIBER do .env (default: whisperx, 100% local) e devolve a implementação
+       correspondente. Import lazy dentro de cada branch: quem usa 'openai' nunca carrega
+       dependências de outros transcribers (ex.: torch/whisperx)."""
+    nome = os.getenv("TRANSCRIBER", "whisperx").lower()
 
     if nome == "openai":
         from .openai_transcriber import OpenAITranscriber

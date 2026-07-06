@@ -18,8 +18,8 @@ No subscriptions. No time limits. No distractions.
 
 - Records microphone and system audio simultaneously (WASAPI loopback — captures any call app, no bot joining your meeting)
 - Transcribes **and diarizes** progressively while you're still talking — no waiting at the end
-- Speaker-labeled transcript: `[Raffa]` / `[Interlocutor]`, not `SPEAKER_00`
-- Pluggable transcription backend: OpenAI API or 100% local (WhisperX), one env var to switch
+- Speaker-labeled transcript with your names, not `SPEAKER_00`: labels are configurable (`MEMORYMEET_SPEAKER` / `MEMORYMEET_INTERLOCUTOR`)
+- **Local-first**: transcription runs 100% on your machine by default (WhisperX) — no audio leaves your computer, no per-minute cost. OpenAI API available as a plug-in alternative
 - Live progress in the UI: `transcribing 2 of 3` — never a blind spinner
 - Saves MP3 + TXT to `~/Documents/MemoryMeet/`
 
@@ -69,39 +69,21 @@ flowchart LR
 ## Requirements
 
 - Windows 10/11
-- Python 3.10+ (**3.12 exactly** for the local WhisperX backend)
-- An OpenAI API key (default backend) — or nothing at all, if you use the local WhisperX backend
+- **Python 3.12** (exactly — see note below) for the default local backend; 3.10+ if you use the OpenAI backend
+- A free Hugging Face token (default backend) — or an OpenAI API key, if you prefer the cloud backend
 
 ## Setup
+
+The default backend (WhisperX) runs entirely on your CPU. Python **3.12 specifically**: `whisperx`'s
+dependency chain (`faster-whisper`/`ctranslate2`) doesn't have wheels for very new Python versions yet
+(checked against 3.14 on 03/07/2026).
 
 ```bash
 git clone https://github.com/raffacabofrio/memory-meet.git
 cd memory-meet
-pip install -r requirements.txt
-cp .env.example .env
-# Add your OpenAI API key to .env
-python main.py
-```
-
-## Transcription backend
-
-Transcription + diarization is a pluggable layer (`transcribers/`). Pick one via `.env`:
-
-```
-TRANSCRIBER=openai      # default — calls OpenAI's gpt-4o-transcribe-diarize API, costs per minute
-TRANSCRIBER=whisperx    # 100% local — faster-whisper + wav2vec2 + pyannote, no API calls, no cost
-```
-
-### WhisperX (local) setup
-
-Runs entirely on your CPU — no audio ever leaves your machine, no per-minute cost. Requires **Python 3.12**
-specifically: `whisperx`'s dependency chain (`faster-whisper`/`ctranslate2`) doesn't have wheels for very new
-Python versions yet (checked against 3.14 on 03/07/2026). If your global Python is newer, create a dedicated venv:
-
-```bash
 py -3.12 -m venv .venv
 .venv\Scripts\pip install -r requirements.txt -r requirements-whisperx.txt
-.venv\Scripts\python main.py
+cp .env.example .env
 ```
 
 The diarization model is gated on Hugging Face — one-time setup:
@@ -112,6 +94,16 @@ The diarization model is gated on Hugging Face — one-time setup:
 3. Generate a read token: https://hf.co/settings/tokens
 4. Add to `.env`: `HF_TOKEN=hf_...`
 
+Then set your name for the transcript labels and run:
+
+```bash
+# in .env: MEMORYMEET_SPEAKER=YourName
+.venv\Scripts\python main.py
+```
+
+First launch downloads the model weights (~1-2GB, one-time, cached afterward), so it takes a few
+minutes to start. After that, models load eagerly at startup (~3 min on a modest CPU).
+
 Optional tuning in `.env` (defaults shown):
 
 ```
@@ -121,12 +113,23 @@ WHISPERX_LANGUAGE=pt
 MEMORYMEET_WORKERS=1          # parallel transcription workers — keep 1 on CPU (see Architecture)
 ```
 
-First launch downloads the model weights (~1-2GB, one-time, cached afterward) and takes noticeably longer to
-start than the OpenAI backend, since models load eagerly at startup rather than on first recording.
-
 Known limitation: with the WhisperX backend, speaker labels currently come out generic (`SPEAKER_00`, `SPEAKER_01`...)
-instead of the real names — mapping them via voice-reference embeddings is a follow-up, not yet implemented.
+instead of the configured names — mapping them via voice-reference embeddings is a follow-up, not yet implemented.
 The OpenAI backend labels speakers by name.
+
+## Alternative backend: OpenAI API
+
+Transcription + diarization is a pluggable layer (`transcribers/`). If you'd rather not run models
+locally (or your machine can't), switch to OpenAI's `gpt-4o-transcribe-diarize` — costs per minute,
+audio goes to the API, but it's lighter to set up (any Python 3.10+, no model downloads):
+
+```bash
+pip install -r requirements.txt
+# in .env:
+#   TRANSCRIBER=openai
+#   OPENAI_API_KEY=sk-...
+python main.py
+```
 
 ## Usage
 
