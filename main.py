@@ -7,12 +7,15 @@ import customtkinter as ctk
 import pyaudiowpatch as pyaudio
 import numpy as np
 import threading
+import queue
 import datetime
 import os
 import time
 import logging
 import lameenc
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 from transcribers import get_transcriber
@@ -48,6 +51,7 @@ FORMAT         = pyaudio.paInt16
 CHANNELS       = 2
 MP3_BITRATE    = 128
 CHUNK_SEGUNDOS = 5 * 60
+WORKERS        = int(os.getenv("MEMORYMEET_WORKERS", "1"))  # N>1 exige transcriber thread-safe (ver processar_chunk)
 REF_ALVO_SEG    = 8         # duração da janela de referência de voz (2-10s)
 REF_MIN_ENERGIA = 150       # piso de energia (mean abs int16) p/ considerar que o canal tem fala (não ancorar silêncio)
 
@@ -111,6 +115,55 @@ def format_segments(segments):
         else:
             blocos.append([speaker, text])
     return "\n\n".join(f"[{spk}] {txt}" for spk, txt in blocos)
+
+
+# ── pipeline de chunks ────────────────────────────────────────────────────────
+# Cortador (produtor) → fila de jobs → workers (função pura) → fila de resultados
+# → orquestrador (consumidor único dos side effects: MP3, TXT e UI).
+
+@dataclass(frozen=True)
+class ChunkJob:
+    """Trabalho imutável: frames crus + snapshot das referências de voz."""
+    index: int
+    mic: tuple
+    sys: tuple
+    refs: tuple          # SpeakerRefs já ancoradas — worker não muta nada
+    is_final: bool
+
+    @property
+    def label(self):
+        return "final" if self.is_final else str(self.index)
+
+
+@dataclass(frozen=True)
+class ChunkResult:
+    index: int
+    is_final: bool
+    mp3: Optional[bytes]
+    texto: str
+    erro: Optional[str] = None
+
+
+def processar_chunk(job: ChunkJob, transcriber, rate: int) -> ChunkResult:
+    """Função pura: não escreve arquivo, não toca UI, não muta estado compartilhado.
+       É o que permite N workers em paralelo — mas N>1 exige transcriber thread-safe;
+       o WhisperX local compartilha o modelo entre chamadas, então manter WORKERS=1
+       até rodar em GPU ou com um modelo por worker."""
+    try:
+        if not job.mic and not job.sys:
+            return ChunkResult(job.index, job.is_final, None, "")
+        audio = mix_frames(job.mic, job.sys) if (job.mic and job.sys) else (
+                np.concatenate(job.mic) if job.mic else np.concatenate(job.sys))
+        logging.info("Chunk %s — samples: %d", job.label, len(audio))
+        mp3 = audio_para_mp3(audio, rate)
+        logging.info("Chunk %s — MP3 %.1f MB", job.label, len(mp3) / 1024 / 1024)
+        segments = transcriber.transcribe_and_diarize(audio, rate, list(job.refs))
+        texto = format_segments(segments)
+        logging.info("Chunk %s — %d segmentos, %d chars", job.label, len(segments), len(texto))
+        return ChunkResult(job.index, job.is_final, mp3, texto)
+    except Exception as e:
+        logging.error("Erro chunk %s: %s", job.label, e, exc_info=True)
+        return ChunkResult(job.index, job.is_final, None, "", str(e))
 
 
 # ── app ───────────────────────────────────────────────────────────────────────
@@ -344,6 +397,11 @@ class MemoryMeet:
         self._ultimo_arquivo = None
         self._ref_mic     = None
         self._ref_sys     = None
+        self._chunks_emitidos   = 0
+        self._chunks_concluidos = 0
+        self._txt_escrito       = False
+        self.job_queue    = queue.Queue()
+        self.result_queue = queue.Queue()
 
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
         self._mp3_path = APP_DIR / f"meet_{ts}.mp3"
@@ -363,7 +421,10 @@ class MemoryMeet:
         self._thread_sys = threading.Thread(target=self._record_system, daemon=True)
         self._thread_mic.start()
         self._thread_sys.start()
-        threading.Thread(target=self._chunk_loop, daemon=True).start()
+        for _ in range(WORKERS):
+            threading.Thread(target=self._worker_loop, daemon=True).start()
+        threading.Thread(target=self._orchestrator_loop, daemon=True).start()
+        threading.Thread(target=self._cutter_loop, daemon=True).start()
 
     def parar(self):
         self.gravando = False
@@ -465,7 +526,9 @@ class MemoryMeet:
         self.mic_frames, self.sys_frames = [], []
         return mic, sys
 
-    def _chunk_loop(self):
+    def _cutter_loop(self):
+        """Produtor: corta a cada CHUNK_SEGUNDOS e enfileira — nunca espera transcrição.
+           (Antes cortava só depois de transcrever, e os chunks cresciam de 5 pra 18 min.)"""
         while True:
             parou = self.stop_event.wait(timeout=CHUNK_SEGUNDOS)
             if parou:
@@ -473,12 +536,89 @@ class MemoryMeet:
                     if t:
                         t.join(timeout=10)
             mic, sys = self._swap_frames()
-            if mic or sys:
+            if mic or sys or parou:
+                self._anchor_references(mic, sys)
                 self._chunk_index += 1
-                self._processar_chunk(mic, sys, is_final=parou)
+                self._chunks_emitidos = self._chunk_index
+                self.job_queue.put(ChunkJob(self._chunk_index, tuple(mic), tuple(sys),
+                                            self._speaker_refs(), parou))
+                self._update_progress()
             if parou:
-                break
-        self._finalizar()
+                return
+
+    def _worker_loop(self):
+        while True:
+            job = self.job_queue.get()
+            if job is None:
+                return
+            self.result_queue.put(processar_chunk(job, self.transcriber, self.rate))
+
+    def _orchestrator_loop(self):
+        """Consumidor único dos side effects: recebe resultados em qualquer ordem,
+           reordena por índice e só ele escreve MP3/TXT e atualiza a UI."""
+        pendentes, proximo = {}, 1
+        while True:
+            r = self.result_queue.get()
+            pendentes[r.index] = r
+            while proximo in pendentes:
+                r = pendentes.pop(proximo)
+                self._gravar_resultado(r)
+                proximo += 1
+                self._chunks_concluidos = r.index
+                if r.is_final:
+                    for _ in range(WORKERS):
+                        self.job_queue.put(None)
+                    self.root.after(0, self._finalizar)
+                    return
+                self._update_progress()
+
+    def _gravar_resultado(self, r: ChunkResult):
+        if r.erro:
+            return                      # já logado no worker; os próximos chunks seguem
+        if r.mp3:
+            with open(self._mp3_path, "ab") as f:
+                f.write(r.mp3)
+        if r.texto:
+            with open(self._txt_path, "a", encoding="utf-8") as f:
+                if self._txt_escrito:
+                    f.write("\n\n")
+                f.write(r.texto)
+            self._txt_escrito = True
+
+    def _anchor_references(self, mic, sys):
+        # Ancora os dois falantes no cortador (barato — só varre energia): o job leva
+        # um snapshot imutável e o worker fica puro. Montada no 1º chunk com fala
+        # suficiente e reusada nos seguintes — o diarize renumera falantes por chamada,
+        # a âncora estabiliza os rótulos.
+        if self._ref_mic is None:
+            self._ref_mic = self._build_reference(mic)
+            if self._ref_mic is not None:
+                logging.info("Referência [Raffa] montada")
+        if self._ref_sys is None:
+            self._ref_sys = self._build_reference(sys)
+            if self._ref_sys is not None:
+                logging.info("Referência [Interlocutor] montada")
+
+    def _speaker_refs(self):
+        refs = []
+        if self._ref_mic is not None:
+            refs.append(SpeakerRef(name="Raffa", audio=self._ref_mic, rate=self.rate))
+        if self._ref_sys is not None:
+            refs.append(SpeakerRef(name="Interlocutor", audio=self._ref_sys, rate=self.rate))
+        return tuple(refs)
+
+    def _update_progress(self):
+        feitos, total = self._chunks_concluidos, self._chunks_emitidos
+        def aplicar():
+            if self.gravando:
+                texto = "Gravando..."
+                if feitos < total:
+                    texto += f"   ·   transcrevendo {feitos + 1} de {total}"
+                self.lbl_status.configure(text=texto, text_color=RED)
+            elif feitos < total:
+                self.lbl_status.configure(text=f"Finalizando  ·  trecho {feitos + 1} de {total}",
+                                          text_color=ORANGE)
+        self.root.after(0, aplicar)
 
     def _build_reference(self, frames):
         """Acha os ~8s de fala mais limpa do canal (varre tudo, pega a janela de maior energia) e
@@ -499,59 +639,6 @@ class MemoryMeet:
         except Exception as e:
             logging.error("Falha ao montar referência: %s", e, exc_info=True)
             return None
-
-    def _processar_chunk(self, mic, sys, is_final=False):
-        label = "final" if is_final else str(self._chunk_index)
-        try:
-            audio = mix_frames(mic, sys) if (mic and sys) else (
-                    np.concatenate(mic) if mic else np.concatenate(sys))
-
-            logging.info("Chunk %s — samples: %d", label, len(audio))
-            mp3 = audio_para_mp3(audio, self.rate)
-            logging.info("Chunk %s — MP3 %.1f MB", label, len(mp3) / 1024 / 1024)
-
-            with open(self._mp3_path, "ab") as f:
-                f.write(mp3)
-
-            # Ancora os dois falantes: referência limpa do canal de cada um (mic=Raffa,
-            # sistema=Interlocutor), montada no primeiro chunk com fala suficiente e reusada
-            # nos seguintes — estabiliza os rótulos entre chunks (o diarize renumera por chamada).
-            if self._ref_mic is None:
-                self._ref_mic = self._build_reference(mic)
-                if self._ref_mic is not None:
-                    logging.info("Chunk %s — referência [Raffa] montada", label)
-            if self._ref_sys is None:
-                self._ref_sys = self._build_reference(sys)
-                if self._ref_sys is not None:
-                    logging.info("Chunk %s — referência [Interlocutor] montada", label)
-
-            refs = []
-            if self._ref_mic is not None:
-                refs.append(SpeakerRef(name="Raffa", audio=self._ref_mic, rate=self.rate))
-            if self._ref_sys is not None:
-                refs.append(SpeakerRef(name="Interlocutor", audio=self._ref_sys, rate=self.rate))
-
-            segments = self.transcriber.transcribe_and_diarize(audio, self.rate, refs)
-            texto = format_segments(segments)
-            logging.info("Chunk %s — %d segmentos, %d chars", label, len(segments), len(texto))
-
-            if texto:
-                with open(self._txt_path, "a", encoding="utf-8") as f:
-                    if self._chunk_index > 1:
-                        f.write("\n\n")
-                    f.write(texto)
-
-            if not is_final and self.gravando:
-                self._flash_status("✓ trecho processado", GREEN, restore_after_ms=3000)
-
-        except Exception as e:
-            logging.error("Erro chunk %s: %s", label, e, exc_info=True)
-
-    def _flash_status(self, msg, color, restore_after_ms=3000):
-        self.lbl_status.configure(text=msg, text_color=color, font=ctk.CTkFont(size=12))
-        self.root.after(restore_after_ms,
-                        lambda: self.lbl_status.configure(text="Gravando...", text_color=RED)
-                        if self.gravando else None)
 
     def _finalizar(self):
         try:

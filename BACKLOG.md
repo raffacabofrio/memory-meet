@@ -4,6 +4,21 @@ Itens pendentes e ideias futuras. O mais maduro fica no topo.
 
 ---
 
+## ✅ FEITO — Pipeline de chunks paralelo (cortador → workers puros → orquestrador) — 06/07/2026
+
+Resolvido o bug do `_chunk_loop` síncrono (diagnóstico de 01/07, sentido na prática em 06/07: entrevista We Are Meta com "Finalizando" de ~18 min porque os chunks cresceram 5→9→14→18 min em cascata).
+
+### Arquitetura
+- **Cortador** (`_cutter_loop`): corta a cada `CHUNK_SEGUNDOS` fixos e enfileira `ChunkJob` imutável (frames + snapshot das referências de voz). Nunca espera transcrição — chunk é sempre ~5 min.
+- **Worker** (`_worker_loop` → `processar_chunk`): função **pura** — mix, MP3, transcrição. Zero side effects (sem arquivo, sem UI, sem estado compartilhado).
+- **Orquestrador** (`_orchestrator_loop`): consumidor único dos side effects. Reordena resultados por índice e só ele escreve MP3/TXT (ordem garantida) e atualiza a UI.
+- **Feedback sutil na UI:** "Gravando... · transcrevendo 2 de 3" durante a call; "Finalizando · trecho 4 de 4" no fim. Adeus spinner cego.
+
+### Regra do WORKERS (decidido analisando o hardware em 06/07/2026)
+`MEMORYMEET_WORKERS` no `.env`, **default 1 — não subir neste notebook**: o ctranslate2 já paraleliza por dentro (~3,5 dos 8 cores do Ultra 5 115U), não sobra RAM pra segundo modelo (stack usa 4,7 GB de 15,5) e o pipeline pyannote não é confiável pra chamadas concorrentes no mesmo modelo. N>1 só faz sentido com GPU ou um modelo por worker.
+
+---
+
 ## 🟡 Migrar transcrição+diarização pra local (faster-whisper + pyannote.audio) — registrado 01/07/2026, implementação iniciada 03/07/2026
 
 **Status (03/07/2026):** camada `transcribers/` implementada e validada ponta a ponta — `TRANSCRIBER=openai|whisperx` no `.env`, WhisperX rodando 100% local (venv Python 3.12 dedicado, ver README). Testado com gravação real: transcrição correta, diarização funcionando com rótulo genérico (`SPEAKER_00`). **Pendente:** mapear `SPEAKER_00`/`01` pro nome real (Raffa/Interlocutor) via embedding de voz das referências ancoradas — pyannote já devolve `speaker_embeddings` prontos (`DiarizationPipeline(..., return_embeddings=True)`), falta só o casamento por similaridade. Também pendente decidir se vale resolver o cold start de ~3min pra carregar os modelos (hoje eager no `__init__`).
@@ -24,7 +39,7 @@ Se a família de modelos atual (`tiny`→`large-v3`/`turbo`, todos via `ctransla
 **Trade-offs a validar antes de migrar:**
 - **Sem GPU dedicada neste notebook** (só Intel Graphics integrado, sem `nvidia-smi` — checado em 01/07/2026). `faster-whisper` roda razoável em CPU (modelo pequeno/médio + int8); `pyannote.audio` em CPU é mais lento que com GPU. **Não é bloqueio real:** a arquitetura já processa em chunks com antecedência (não é tempo real hoje, mesmo com a API da OpenAI), então o que importa é só não acumular atraso indefinidamente — mesmo critério que já vale pro bug do `_chunk_loop` síncrono acima. Raffa está otimista que CPU dá conta nesse regime.
 - A diarização por pyannote tende a ser um pouco menos estável em trocas rápidas de falante do que a abordagem atual (duas referências de voz ancoradas por canal, mic/sistema) — pode precisar adaptar a lógica de referência ancorada pro pyannote, não só trocar o modelo.
-- Não elimina o bug do `_chunk_loop` síncrono por si só — são dois problemas distintos (estabilidade da API vs. arquitetura de chunking); resolver um não resolve o outro automaticamente.
+- ~~Não elimina o bug do `_chunk_loop` síncrono por si só~~ — resolvido em 06/07/2026 com o pipeline cortador→worker→orquestrador (ver item FEITO acima).
 
 ---
 
