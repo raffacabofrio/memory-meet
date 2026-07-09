@@ -90,6 +90,32 @@ Integrar com o Google Calendar pra puxar os participantes do evento e mapear `[I
 
 ---
 
+## 💡 Futuro — Versão navegador (PWA em JS), zero instalação — emergida 09/07/2026
+
+Ideia: uma versão do MemoryMeet que roda 100% no navegador, sem Python, sem setup. Bom pra "abre e grava" rápido, mantendo o app nativo como ferramenta séria (background, performance, entrevista longa).
+
+### Cenário de uso pensado
+Raffa abre a aba do MemoryMeet **antes** da agenda → o app pede o que capturar (`getDisplayMedia`) e ele escolhe **a aba do próprio Meet/Teams** com "compartilhar áudio da aba" (captura só a voz do outro lado, canal limpo, sem notificação/Spotify) → o mic dele é capturado em paralelo por `getUserMedia` em outro canal (mic não é exclusivo, não conflita com o Meet usando o mic) → faz a reunião → volta na aba e clica "finalizar".
+
+### Peças e viabilidade
+- **Mic (Raffa):** `getUserMedia({audio})` — trivial.
+- **Outro lado (Interlocutor):** `getDisplayMedia({audio:true})` compartilhando a aba da reunião. **Chrome/Edge no Windows.**
+- **Separação de speaker:** dois `MediaStream` = dois canais físicos → **rotular por canal e descartar o pyannote inteiro**. A peça sem porta boa em JS é exatamente a que não precisaríamos portar — mesma estratégia de canal ancorado que já dá o melhor resultado hoje (mic=Raffa, loopback=Interlocutor).
+- **Transcrição:** `transformers.js` (Xenova/whisper) via WASM ou **WebGPU**.
+- **Saída MP3/TXT:** `lamejs`/MediaRecorder + File System Access API.
+
+### O pivô do design — Web Worker (decisivo, 09/07/2026)
+Design ingênuo (transcrever tudo no "finalizar") **trava** — parece que o app pendurou. Errado. Espelhar a arquitetura do app Python: **transcrição incremental num Web Worker** durante a gravação. Worker de background é estrangulado **bem menos** que a thread principal (o throttling de aba de fundo pega timers/rAF da main thread, não o Worker), então dá pra transcrever picado enquanto grava; no "finalizar" quase tudo já está pronto e o encerramento é rápido. **Sem o Worker, o produto não existe.**
+
+### Os dois riscos reais (o resto é resolvível)
+1. **Velocidade do WebGPU no Ultra 5:** na melhor hipótese ~1x tempo real (igual ao nativo). Se segurar 1x, o incremental acompanha e "finalizar" é instantâneo. Se ficar 2-3x mais lento, acumula atraso e a espera volta. **Empírico — só medindo.** Próximo passo concreto: página de teste que transcreve um áudio e cronometra WebGPU, **sem** captura de reunião, só pra ter o número antes de investir.
+2. **Tarja de compartilhamento:** o Chrome mostra "está compartilhando esta aba" com botão "Parar" durante a call. Não tem como esconder em browser puro. Fricção genuína — é, sozinha, um bom motivo pra manter o nativo como ferramenta principal.
+
+### Pegadinha de plataforma
+Meet é sempre no navegador → share da aba funciona limpo. **Teams no app desktop** não dá pra compartilhar "a aba" → cairia em "tela inteira + áudio do sistema" (mais sujo, pega tudo). Teams **no navegador** funciona igual ao Meet.
+
+---
+
 ## 📌 Itens antigos (da v2, sessão de nascimento 19/06/2026)
 
 - **Instância única** — se o app já estiver aberto, trazer a janela pra frente em vez de abrir outra.
