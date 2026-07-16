@@ -159,6 +159,9 @@ def processar_chunk(job: ChunkJob, transcriber, rate: int) -> ChunkResult:
         logging.info("Chunk %s — samples: %d", job.label, len(audio))
         mp3 = audio_para_mp3(audio, rate)
         logging.info("Chunk %s — MP3 %.1f MB", job.label, len(mp3) / 1024 / 1024)
+        if transcriber is None:   # modelo falhou ao carregar — preserva o áudio mesmo assim
+            logging.warning("Chunk %s — sem transcriber, salvando só o MP3", job.label)
+            return ChunkResult(job.index, job.is_final, mp3, "")
         segments = transcriber.transcribe_and_diarize(audio, rate, list(job.refs))
         texto = format_segments(segments)
         logging.info("Chunk %s — %d segmentos, %d chars", job.label, len(segments), len(texto))
@@ -195,7 +198,11 @@ class MemoryMeet:
         self._txt_path        = None
         self._ref_mic         = None
         self._ref_sys         = None
-        self.transcriber      = get_transcriber()
+        # Modelo carrega em background: whisperx puxa torch + 3 modelos (~dezenas de
+        # segundos em CPU) e travava o mainloop antes da janela abrir. A gravação não
+        # depende dele — só o worker espera o evento antes de transcrever.
+        self.transcriber        = None
+        self._transcriber_ready = threading.Event()
 
         self.p = pyaudio.PyAudio()
         try:
@@ -209,6 +216,23 @@ class MemoryMeet:
             self.loopback = None
 
         self._build_ui()
+        threading.Thread(target=self._load_transcriber, daemon=True).start()
+
+    def _load_transcriber(self):
+        try:
+            t0 = time.time()
+            self.transcriber = get_transcriber()
+            logging.info("Transcriber carregado em %.1fs", time.time() - t0)
+            self.root.after(0, lambda: self.lbl_modelo.configure(text=""))
+        except Exception as e:
+            logging.error("Falha ao carregar transcriber: %s", e, exc_info=True)
+            self.root.after(0, self._modelo_falhou)
+        finally:
+            self._transcriber_ready.set()
+
+    def _modelo_falhou(self):
+        self.btn_gravar.configure(state="disabled")
+        self.lbl_modelo.configure(text="Erro ao carregar modelo (ver log)", text_color=RED)
 
     # ── build ──────────────────────────────────────────────────────────────────
 
@@ -235,7 +259,13 @@ class MemoryMeet:
             fg_color=RED, hover_color="#c03030",
             command=self.iniciar
         )
-        self.btn_gravar.pack(pady=(0, 32))
+        self.btn_gravar.pack(pady=(0, 8))
+
+        self.lbl_modelo = ctk.CTkLabel(
+            self.frame_idle, text="Carregando modelo…",
+            font=ctk.CTkFont(size=10), text_color=TEXT_DIM, height=14
+        )
+        self.lbl_modelo.pack(pady=(0, 10))
 
         if self.loopback is None:
             self.btn_gravar.configure(state="disabled")
@@ -549,6 +579,7 @@ class MemoryMeet:
                 return
 
     def _worker_loop(self):
+        self._transcriber_ready.wait()   # modelo carrega em background no startup
         while True:
             job = self.job_queue.get()
             if job is None:
