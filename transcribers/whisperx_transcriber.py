@@ -1,12 +1,17 @@
+import logging
 import os
 from math import gcd
 
 import numpy as np
 from scipy.signal import resample_poly
 
-from .base import Segment, Transcriber
+from .base import Segment, SpeakerRef, Transcriber
 
 SAMPLE_RATE = 16000  # whisperx.audio.SAMPLE_RATE — todo o pipeline espera mono float32 nessa taxa
+
+# Similaridade de cosseno mínima pra aceitar o match SPEAKER_XX -> nome real. Abaixo disso,
+# melhor manter o rótulo genérico do que arriscar nomear errado (ver _map_speakers).
+REF_SIM_THRESHOLD = float(os.getenv("WHISPERX_REF_SIM_THRESHOLD", "0.5"))
 
 
 def _to_whisperx_audio(audio: np.ndarray, rate: int) -> np.ndarray:
@@ -20,13 +25,25 @@ def _to_whisperx_audio(audio: np.ndarray, rate: int) -> np.ndarray:
     return mono.astype(np.float32)
 
 
+def _cosine_sim(a, b) -> float:
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
 class WhisperXTranscriber(Transcriber):
     """100% local: faster-whisper (transcrição) + wav2vec2 (alinhamento) + pyannote (diarização),
        empacotados pelo whisperx. Modelos carregados uma vez aqui no __init__ e reusados por chunk.
 
-       Diarização ainda é genérica (SPEAKER_00/SPEAKER_01...) — mapear esses rótulos pro nome real
-       (Raffa/Interlocutor) a partir das referências ancoradas (`refs`) é o próximo passo, ainda não
-       implementado: por ora o parâmetro é aceito pra cumprir o contrato mas não é usado."""
+       Diarização sai genérica (SPEAKER_00/SPEAKER_01...) do pyannote — pra virar nome real
+       (Raffa/Interlocutor), usamos `return_embeddings=True` da DiarizationPipeline (embedding por
+       SPEAKER_XX detectado, sem custo extra) e comparamos por similaridade de cosseno com o
+       embedding de cada referência ancorada (`refs`), extraído rodando a mesma pipeline no clip
+       de referência com `num_speakers=1`. Mesmo espaço vetorial dos dois lados, sem depender de
+       modelo de embedding adicional."""
 
     def __init__(self):
         import whisperx
@@ -47,6 +64,59 @@ class WhisperXTranscriber(Transcriber):
         self.align_model, self.align_meta = whisperx.load_align_model(
             language_code=self.language, device=self.device)
 
+        # Embedding de referência é caro (roda a pipeline de diarize inteira) e as refs são
+        # montadas uma vez em main.py e reusadas em todos os chunks — cachear por identidade
+        # evita recalcular a cada chunk de 5 min.
+        self._ref_embedding_cache: dict[int, list | None] = {}
+
+    def _ref_embedding(self, ref: SpeakerRef):
+        """Embedding do clip de referência (fala de um só canal, já filtrado pra janela de maior
+           energia em main.py) — roda a mesma DiarizationPipeline com num_speakers=1 e pega o
+           único embedding devolvido. None se a pipeline não conseguir extrair nada do clip."""
+        cache_key = id(ref)
+        if cache_key in self._ref_embedding_cache:
+            return self._ref_embedding_cache[cache_key]
+
+        emb = None
+        try:
+            wx_ref_audio = _to_whisperx_audio(ref.audio, ref.rate)
+            _, embeddings = self.diarize_model(wx_ref_audio, num_speakers=1, return_embeddings=True)
+            if embeddings:
+                emb = next(iter(embeddings.values()))
+        except Exception:
+            logging.exception("Falha ao extrair embedding da referência [%s]", ref.name)
+
+        self._ref_embedding_cache[cache_key] = emb
+        return emb
+
+    def _map_speakers(self, refs, speaker_embeddings):
+        """SPEAKER_XX (pyannote) -> nome real (Raffa/Interlocutor) por similaridade de cosseno
+           com as referências ancoradas. Sem refs ou sem embeddings, devolve mapeamento vazio —
+           os rótulos genéricos seguem intactos (compatibilidade com o comportamento atual).
+           Se a melhor similaridade ficar abaixo de REF_SIM_THRESHOLD, também não mapeia: é
+           melhor manter SPEAKER_XX do que atribuir um nome errado com baixa confiança."""
+        if not refs or not speaker_embeddings:
+            return {}
+
+        ref_embs = [(r.name, self._ref_embedding(r)) for r in refs]
+        ref_embs = [(name, emb) for name, emb in ref_embs if emb is not None]
+        if not ref_embs:
+            return {}
+
+        mapping = {}
+        for spk, emb in speaker_embeddings.items():
+            best_name, best_sim = None, -1.0
+            for name, ref_emb in ref_embs:
+                sim = _cosine_sim(emb, ref_emb)
+                if sim > best_sim:
+                    best_sim, best_name = sim, name
+            if best_name is not None and best_sim >= REF_SIM_THRESHOLD:
+                mapping[spk] = best_name
+            else:
+                logging.info("Speaker %s sem match confiável (melhor sim=%.2f) — mantendo rótulo genérico",
+                             spk, best_sim)
+        return mapping
+
     def transcribe_and_diarize(self, audio, rate, refs):
         wx_audio = _to_whisperx_audio(audio, rate)
 
@@ -54,10 +124,14 @@ class WhisperXTranscriber(Transcriber):
         result = self._whisperx.align(result["segments"], self.align_model, self.align_meta,
                                        wx_audio, self.device)
 
-        diarize_df = self.diarize_model(wx_audio)
+        diarize_df, speaker_embeddings = self.diarize_model(wx_audio, return_embeddings=True)
         result = self._whisperx.assign_word_speakers(diarize_df, result)
 
-        return [
-            Segment(speaker=seg.get("speaker", "") or "SPEAKER", text=(seg.get("text") or ""))
-            for seg in result.get("segments", [])
-        ]
+        speaker_map = self._map_speakers(refs, speaker_embeddings)
+
+        segments = []
+        for seg in result.get("segments", []):
+            raw_speaker = seg.get("speaker", "") or "SPEAKER"
+            speaker = speaker_map.get(raw_speaker, raw_speaker)
+            segments.append(Segment(speaker=speaker, text=(seg.get("text") or "")))
+        return segments
