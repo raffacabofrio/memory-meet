@@ -421,6 +421,9 @@ class MemoryMeet:
     # ── controle ──────────────────────────────────────────────────────────────
 
     def iniciar(self):
+        self.btn_parar.configure(fg_color="#333344", hover_color="#444455",
+                                 text_color=("white", "white"), state="normal")
+        self.btn_parar.pack(pady=(0, 32))
         self.gravando = True
         self.stop_event.clear()
         self.mic_frames   = []
