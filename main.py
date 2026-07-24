@@ -121,15 +121,18 @@ def format_segments(segments):
 
 # ── pipeline de chunks ────────────────────────────────────────────────────────
 # Cortador (produtor) → fila de jobs → workers (função pura) → fila de resultados
-# → orquestrador (consumidor único dos side effects: MP3, TXT e UI).
+# → orquestrador (consumidor único dos side effects: TXT e UI).
+# O MP3 é escrito antes disso tudo, direto pelo cortador, assim que cada chunk é
+# cortado/mixado — não fica esperando o resultado da transcrição (ver _cutter_loop).
 
 @dataclass(frozen=True)
 class ChunkJob:
-    """Trabalho imutável: frames crus + snapshot das referências de voz."""
+    """Trabalho imutável: áudio já mixado (o MP3 já foi cortado/codificado e gravado em
+       disco pelo cortador — ver _cutter_loop) + snapshot das referências de voz. O worker
+       só transcreve; não mexe mais em áudio."""
     index: int
-    mic: tuple
-    sys: tuple
-    refs: tuple          # SpeakerRefs já ancoradas — worker não muta nada
+    audio: object         # np.ndarray mixado, ou None se o chunk não teve áudio
+    refs: tuple            # SpeakerRefs já ancoradas — worker não muta nada
     is_final: bool
 
     @property
@@ -141,7 +144,6 @@ class ChunkJob:
 class ChunkResult:
     index: int
     is_final: bool
-    mp3: Optional[bytes]
     texto: str
     erro: Optional[str] = None
 
@@ -150,25 +152,22 @@ def processar_chunk(job: ChunkJob, transcriber, rate: int) -> ChunkResult:
     """Função pura: não escreve arquivo, não toca UI, não muta estado compartilhado.
        É o que permite N workers em paralelo — mas N>1 exige transcriber thread-safe;
        o WhisperX local compartilha o modelo entre chamadas, então manter WORKERS=1
-       até rodar em GPU ou com um modelo por worker."""
+       até rodar em GPU ou com um modelo por worker.
+       O áudio do chunk já está seguro em disco antes desta função rodar (gravado pelo
+       cortador) — uma falha de transcrição aqui derruba só o texto, nunca o áudio."""
     try:
-        if not job.mic and not job.sys:
-            return ChunkResult(job.index, job.is_final, None, "")
-        audio = mix_frames(job.mic, job.sys) if (job.mic and job.sys) else (
-                np.concatenate(job.mic) if job.mic else np.concatenate(job.sys))
-        logging.info("Chunk %s — samples: %d", job.label, len(audio))
-        mp3 = audio_para_mp3(audio, rate)
-        logging.info("Chunk %s — MP3 %.1f MB", job.label, len(mp3) / 1024 / 1024)
-        if transcriber is None:   # modelo falhou ao carregar — preserva o áudio mesmo assim
-            logging.warning("Chunk %s — sem transcriber, salvando só o MP3", job.label)
-            return ChunkResult(job.index, job.is_final, mp3, "")
-        segments = transcriber.transcribe_and_diarize(audio, rate, list(job.refs))
+        if job.audio is None:
+            return ChunkResult(job.index, job.is_final, "")
+        if transcriber is None:   # modelo falhou ao carregar — áudio já foi salvo mesmo assim
+            logging.warning("Chunk %s — sem transcriber, só o áudio foi salvo", job.label)
+            return ChunkResult(job.index, job.is_final, "")
+        segments = transcriber.transcribe_and_diarize(job.audio, rate, list(job.refs))
         texto = format_segments(segments)
         logging.info("Chunk %s — %d segmentos, %d chars", job.label, len(segments), len(texto))
-        return ChunkResult(job.index, job.is_final, mp3, texto)
+        return ChunkResult(job.index, job.is_final, texto)
     except Exception as e:
         logging.error("Erro chunk %s: %s", job.label, e, exc_info=True)
-        return ChunkResult(job.index, job.is_final, None, "", str(e))
+        return ChunkResult(job.index, job.is_final, "", str(e))
 
 
 # ── app ───────────────────────────────────────────────────────────────────────
@@ -562,8 +561,15 @@ class MemoryMeet:
         return mic, sys
 
     def _cutter_loop(self):
-        """Produtor: corta a cada CHUNK_SEGUNDOS e enfileira — nunca espera transcrição.
-           (Antes cortava só depois de transcrever, e os chunks cresciam de 5 pra 18 min.)"""
+        """Produtor: corta a cada CHUNK_SEGUNDOS, mixa e já grava o MP3 em disco na hora —
+           nunca espera transcrição pra nada, nem pra cortar o próximo chunk, nem pra
+           persistir o áudio deste. (Antes cortava só depois de transcrever, e os chunks
+           cresciam de 5 pra 18 min.)
+           Bug corrigido em 23/07/2026: o MP3 só ia pro disco junto do texto, no final da
+           transcrição do chunk (ver _gravar_resultado/histórico). Se o app fechasse com o
+           último chunk ainda transcrevendo, o áudio dele — já cortado e mixado — se perdia
+           pra sempre, mesmo estando pronto havia tempo. Agora o áudio fica seguro assim que
+           é cortado; só a transcrição desse trecho fica pendente, falha bem menor."""
         while True:
             parou = self.stop_event.wait(timeout=CHUNK_SEGUNDOS)
             if parou:
@@ -575,11 +581,39 @@ class MemoryMeet:
                 self._anchor_references(mic, sys)
                 self._chunk_index += 1
                 self._chunks_emitidos = self._chunk_index
-                self.job_queue.put(ChunkJob(self._chunk_index, tuple(mic), tuple(sys),
+                label = "final" if parou else str(self._chunk_index)
+                audio = self._mixar_e_gravar_audio(mic, sys, label)
+                self.job_queue.put(ChunkJob(self._chunk_index, audio,
                                             self._speaker_refs(), parou))
                 self._update_progress()
             if parou:
                 return
+
+    def _mixar_e_gravar_audio(self, mic, sys, label):
+        """Mixa os frames crus do chunk e grava o MP3 no arquivo consolidado imediatamente
+           — antes mesmo de enfileirar o chunk pra transcrição. Devolve o áudio mixado (pro
+           worker transcrever) ou None se o chunk não tinha áudio. Roda só no cortador
+           (thread única, sequencial), então é o único escritor do MP3 — sem lock precisando
+           coordenar com o orquestrador, que agora só escreve o TXT."""
+        if not mic and not sys:
+            return None
+        try:
+            audio = mix_frames(mic, sys) if (mic and sys) else (
+                    np.concatenate(mic) if mic else np.concatenate(sys))
+            logging.info("Chunk %s — samples: %d", label, len(audio))
+        except Exception as e:
+            logging.error("Erro ao mixar chunk %s: %s", label, e, exc_info=True)
+            return None
+        try:
+            mp3 = audio_para_mp3(audio, self.rate)
+            with open(self._mp3_path, "ab") as f:
+                f.write(mp3)
+            logging.info("Chunk %s — MP3 %.1f MB gravado", label, len(mp3) / 1024 / 1024)
+        except Exception as e:
+            # Falha só na codificação/gravação do MP3 não deve derrubar a transcrição —
+            # o áudio mixado segue disponível em memória pro worker, mesmo sem ir pro disco.
+            logging.error("Erro ao codificar/gravar MP3 do chunk %s: %s", label, e, exc_info=True)
+        return audio
 
     def _worker_loop(self):
         self._transcriber_ready.wait()   # modelo carrega em background no startup
@@ -590,8 +624,9 @@ class MemoryMeet:
             self.result_queue.put(processar_chunk(job, self.transcriber, self.rate))
 
     def _orchestrator_loop(self):
-        """Consumidor único dos side effects: recebe resultados em qualquer ordem,
-           reordena por índice e só ele escreve MP3/TXT e atualiza a UI."""
+        """Consumidor único dos resultados de transcrição: recebe em qualquer ordem,
+           reordena por índice e só ele escreve o TXT e atualiza a UI. O MP3 não passa
+           mais por aqui — já foi gravado pelo cortador (ver _cutter_loop)."""
         pendentes, proximo = {}, 1
         while True:
             r = self.result_queue.get()
@@ -609,17 +644,15 @@ class MemoryMeet:
                 self._update_progress()
 
     def _gravar_resultado(self, r: ChunkResult):
-        if r.erro:
-            return                      # já logado no worker; os próximos chunks seguem
-        if r.mp3:
-            with open(self._mp3_path, "ab") as f:
-                f.write(r.mp3)
-        if r.texto:
-            with open(self._txt_path, "a", encoding="utf-8") as f:
-                if self._txt_escrito:
-                    f.write("\n\n")
-                f.write(r.texto)
-            self._txt_escrito = True
+        # O MP3 já foi gravado pelo cortador (_mixar_e_gravar_audio) assim que o chunk
+        # foi cortado — aqui só sobra o texto, que de fato precisa esperar a transcrição.
+        if r.erro or not r.texto:
+            return                      # erro já logado no worker; os próximos chunks seguem
+        with open(self._txt_path, "a", encoding="utf-8") as f:
+            if self._txt_escrito:
+                f.write("\n\n")
+            f.write(r.texto)
+        self._txt_escrito = True
 
     def _anchor_references(self, mic, sys):
         # Ancora os dois falantes no cortador (barato — só varre energia): o job leva

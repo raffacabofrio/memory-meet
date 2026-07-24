@@ -4,14 +4,28 @@ Itens pendentes e ideias futuras. O mais maduro fica no topo.
 
 ---
 
+## ✅ FEITO — MP3 do último chunk podia se perder se o app fechasse durante a transcrição — 23/07/2026
+
+**Bug:** `_gravar_resultado` só escrevia o MP3 (e o TXT) quando o `ChunkResult` completo do chunk voltava do worker — ou seja, só depois que a transcrição inteira terminava. Numa gravação real, o app foi fechado com o último chunk (~6,5 min, já cortado e mixado — visto no log: "Chunk 12 — MP3 4.5 MB" bem antes do fechamento) ainda transcrevendo. Como a thread do worker morreu junto com o processo, `_gravar_resultado` nunca rodou pra esse chunk, e o áudio dele — que já existia pronto em memória havia tempo — nunca foi pro MP3 final. Confirmado batendo o timestamp do MP3 consolidado com o log: batia exatamente com o fim da transcrição do chunk *anterior*.
+
+**Causa raiz:** acoplamento desnecessário entre a gravação do áudio e a gravação do texto — os dois só aconteciam juntos, gatilhados pelo fim da transcrição, embora o áudio esteja pronto muito antes (assim que o cortador corta e o worker mixa/codifica, antes mesmo de chamar o transcriber).
+
+**Fix:** o MP3 agora é mixado e gravado em disco pelo **cortador** (`_cutter_loop` → novo `_mixar_e_gravar_audio`), na hora em que o chunk é cortado — antes de ser enfileirado pra transcrição. `ChunkJob` passou a carregar o áudio já mixado (em vez de `mic`/`sys` crus) e `ChunkResult` perdeu o campo `mp3` — o worker (`processar_chunk`) só transcreve. `_gravar_resultado` no orquestrador ficou só com o TXT, que continua reordenado por índice como antes. Efeito: se o app fechar/crashar no meio da transcrição de qualquer chunk (inclusive o "final", o buffer parcial ao apertar Parar — mesmo code path), o áudio dele já está seguro em disco; só o texto desse trecho específico fica faltando, que é uma falha bem menor (dá pra recuperar reprocessando o trecho do MP3, ver `skill-interview-feedback.md` no repo `projeto-carreira-2026`).
+
+Sem lock novo: o cortador é thread única e sequencial, então é o único escritor do MP3 (o orquestrador, que também é único, ficou só com o TXT — arquivos diferentes, sem race).
+
+**Verificação:** sem hardware real (mic/loopback), então testado com simulação isolada do pipeline (`ChunkJob`/`ChunkResult`/`processar_chunk` reais importados de `main.py`, frames e transcriber fake) cobrindo (a) chunk final "trava" antes do worker retornar — MP3 sobrevive intacto, TXT não ganha o texto dele; (b) transcrição falha com exceção tratada — mesma garantia. Não rodado end-to-end com gravação real.
+
+---
+
 ## ✅ FEITO — Pipeline de chunks paralelo (cortador → workers puros → orquestrador) — 06/07/2026
 
 Resolvido o bug do `_chunk_loop` síncrono (diagnóstico de 01/07, sentido na prática em 06/07: entrevista We Are Meta com "Finalizando" de ~18 min porque os chunks cresceram 5→9→14→18 min em cascata).
 
 ### Arquitetura
-- **Cortador** (`_cutter_loop`): corta a cada `CHUNK_SEGUNDOS` fixos e enfileira `ChunkJob` imutável (frames + snapshot das referências de voz). Nunca espera transcrição — chunk é sempre ~5 min.
-- **Worker** (`_worker_loop` → `processar_chunk`): função **pura** — mix, MP3, transcrição. Zero side effects (sem arquivo, sem UI, sem estado compartilhado).
-- **Orquestrador** (`_orchestrator_loop`): consumidor único dos side effects. Reordena resultados por índice e só ele escreve MP3/TXT (ordem garantida) e atualiza a UI.
+- **Cortador** (`_cutter_loop`): corta a cada `CHUNK_SEGUNDOS` fixos, mixa e **já grava o MP3 em disco na hora** (`_mixar_e_gravar_audio`, ver fix de 23/07/2026 acima), depois enfileira `ChunkJob` imutável (áudio já mixado + snapshot das referências de voz). Nunca espera transcrição — chunk é sempre ~5 min, e o áudio nunca fica só em memória esperando o worker.
+- **Worker** (`_worker_loop` → `processar_chunk`): função **pura** — só transcrição. Zero side effects (sem arquivo, sem UI, sem estado compartilhado).
+- **Orquestrador** (`_orchestrator_loop`): consumidor único do resultado da transcrição. Reordena por índice e só ele escreve o TXT (ordem garantida) e atualiza a UI.
 - **Feedback sutil na UI:** "Gravando... · transcrevendo 2 de 3" durante a call; "Finalizando · trecho 4 de 4" no fim. Adeus spinner cego.
 
 ### Regra do WORKERS (decidido analisando o hardware em 06/07/2026)

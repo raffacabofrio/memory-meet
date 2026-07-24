@@ -35,26 +35,26 @@ flowchart LR
         KA["keep-alive<br/>(inaudible silence)"]
     end
 
-    CUT["cutter<br/>slices every 5 min<br/><i>never waits for transcription</i>"]
+    CUT["cutter<br/>slices every 5 min, mixes,<br/>writes mp3 immediately<br/><i>never waits for transcription</i>"]
     JQ[["job queue"]]
-    W["worker × N<br/><b>pure function</b><br/>mix → mp3 → transcribe"]
+    W["worker × N<br/><b>pure function</b><br/>transcribe only"]
     RQ[["result queue"]]
-    ORC["orchestrator<br/>reorders by chunk index<br/><i>sole owner of side effects</i>"]
+    ORC["orchestrator<br/>reorders by chunk index<br/><i>sole owner of the transcript</i>"]
 
     MIC --> CUT
     SYS --> CUT
     KA -. keeps BT endpoint alive .-> SYS
 
-    CUT -- "ChunkJob (immutable)" --> JQ --> W -- "ChunkResult" --> RQ --> ORC
+    CUT --> MP3[("meeting.mp3")]
+    CUT -- "ChunkJob (immutable, mixed audio)" --> JQ --> W -- "ChunkResult (text)" --> RQ --> ORC
 
-    ORC --> MP3[("meeting.mp3")]
     ORC --> TXT[("transcript.txt")]
     ORC --> UI["UI status<br/>'transcribing 2 of 3'"]
 ```
 
-- **Cutter (producer).** Slices the recording into fixed 5-minute chunks on a timer and enqueues an immutable `ChunkJob` — raw frames plus a snapshot of the speaker voice references. It never blocks on transcription.
-- **Worker (pure).** `ChunkJob in → ChunkResult out`. No file writes, no UI, no shared state, and failures return a result carrying the error instead of raising — one bad chunk can't kill the pipeline or corrupt its neighbors. Purity is what makes `N` workers safe.
-- **Orchestrator (single consumer).** Results may arrive out of order; it holds them until the sequence is contiguous, then appends MP3/TXT strictly in chunk order and updates the UI. Since it's the only thread with side effects, there's nothing to lock.
+- **Cutter (producer).** Slices the recording into fixed 5-minute chunks on a timer, mixes the channels, and **writes the MP3 bytes to disk right there** — before the chunk is even queued for transcription. It never blocks on transcription, and the audio never waits on it either.
+- **Worker (pure).** `ChunkJob in → ChunkResult out`. Transcription only — no file writes, no UI, no shared state, and failures return a result carrying the error instead of raising — one bad chunk can't kill the pipeline or corrupt its neighbors, and a failed transcription never takes the chunk's audio down with it (that's already safely on disk). Purity is what makes `N` workers safe.
+- **Orchestrator (single consumer).** Transcription results may arrive out of order; it holds them until the sequence is contiguous, then appends the TXT strictly in chunk order and updates the UI. MP3 and TXT each have exactly one writer thread (cutter and orchestrator respectively), on two different files — nothing to lock.
 
 `MEMORYMEET_WORKERS` defaults to **1** — and that's a measured decision, not a placeholder: the inference engine (`ctranslate2`) already parallelizes internally (~3.5 cores during a transcription), the model stack holds ~4.7 GB of RAM, and the pyannote pipeline isn't safe for concurrent calls on a shared model. More workers only pay off with a GPU or one model per worker.
 
@@ -65,6 +65,8 @@ flowchart LR
 **Bluetooth loopback starvation.** WASAPI loopback stops delivering frames when nothing is playing — Bluetooth suspends the audio stream during silence. The system channel silently came up ~32% shorter than the mic channel, and since mixing pairs frames by index, the two voices overlapped into an unreadable "zipper" transcript. It looked exactly like a diarization bug; it was a capture-sync bug. Fix: a keep-alive thread plays continuous inaudible silence to the output, so the endpoint never suspends. After the fix, channel drift dropped from 32% to 0.3%.
 
 **Stable speaker labels.** Diarization models renumber speakers on every call — chunk 1's `SPEAKER_00` may be chunk 2's `SPEAKER_01`. MemoryMeet exploits a physical fact: it already captures two separate channels (mic = you, system loopback = them). It scans each channel for its highest-energy ~8s window (likely the cleanest speech), gates on an energy floor so silence never becomes an anchor, and reuses those per-channel voice references across all chunks — labels stay consistent for the whole meeting.
+
+**The last chunk that never made it to disk.** Until 2026-07-23, the MP3 append and the TXT append happened together in `_gravar_resultado`, both gated on the *entire* transcription finishing for that chunk — even though the mixed audio exists long before transcription even starts. Close the app (or have it crash) while the last chunk is still transcribing, and its audio — already cut, mixed, and sitting in memory — never reaches the consolidated MP3. It's not delayed, it's gone. Fix: the cutter now mixes and writes each chunk's MP3 immediately after slicing, decoupled from transcription entirely; only the TXT append stays gated on transcription success. Worst case now is a missing transcript for one chunk (recoverable by re-transcribing that slice of the MP3), never missing audio.
 
 ## Requirements
 
