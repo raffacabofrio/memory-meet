@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from math import gcd
 
 import numpy as np
@@ -120,14 +121,25 @@ class WhisperXTranscriber(Transcriber):
     def transcribe_and_diarize(self, audio, rate, refs):
         wx_audio = _to_whisperx_audio(audio, rate)
 
+        t0 = time.perf_counter()
         result = self.model.transcribe(wx_audio, batch_size=8, language=self.language)
+        t_transcricao = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         result = self._whisperx.align(result["segments"], self.align_model, self.align_meta,
                                        wx_audio, self.device)
+        t_alinhamento = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         diarize_df, speaker_embeddings = self.diarize_model(wx_audio, return_embeddings=True)
         result = self._whisperx.assign_word_speakers(diarize_df, result)
-
         speaker_map = self._map_speakers(refs, speaker_embeddings)
+        t_diarizacao = time.perf_counter() - t0
+
+        logging.info(
+            "WhisperX — transcrição: %.1fs | alinhamento: %.1fs | diarização: %.1fs",
+            t_transcricao, t_alinhamento, t_diarizacao,
+        )
 
         segments = []
         for seg in result.get("segments", []):
