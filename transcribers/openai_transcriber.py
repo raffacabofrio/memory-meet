@@ -5,7 +5,7 @@ import os
 import lameenc
 from openai import OpenAI
 
-from .base import Segment, SpeakerRef, Transcriber
+from .base import Segment, SpeakerRef, Transcriber, mix_audio
 
 TRANSCRIBE_MODEL = "gpt-4o-transcribe-diarize"
 MP3_BITRATE = 128
@@ -33,13 +33,19 @@ def _ref_to_data_url(ref: SpeakerRef) -> str:
 class OpenAITranscriber(Transcriber):
     """Usa known_speaker_references da API pra ancorar os nomes — o server faz o
        casamento de voz por conta própria, não precisamos de nenhuma lógica de
-       identificação aqui."""
+       identificação aqui. Diferente do WhisperX local, aqui vale a pena diarizar por voz:
+       o custo é da API, não do CPU local, então mixamos os canais (mix_audio) e mandamos
+       um único áudio pro diarize real do modelo, igual sempre foi."""
 
     def __init__(self, api_key=None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
 
-    def transcribe_and_diarize(self, audio, rate, refs):
+    def transcribe_and_diarize(self, mic_audio, sys_audio, rate, mic_name, sys_name, refs):
         if not self.api_key:
+            return []
+
+        audio = mix_audio(mic_audio, sys_audio)
+        if audio is None:
             return []
 
         mp3 = _audio_para_mp3(audio, rate)

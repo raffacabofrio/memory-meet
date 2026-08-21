@@ -2,17 +2,14 @@ import logging
 import os
 import time
 from math import gcd
+from typing import Optional
 
 import numpy as np
 from scipy.signal import resample_poly
 
-from .base import Segment, SpeakerRef, Transcriber
+from .base import Segment, Transcriber
 
 SAMPLE_RATE = 16000  # whisperx.audio.SAMPLE_RATE — todo o pipeline espera mono float32 nessa taxa
-
-# Similaridade de cosseno mínima pra aceitar o match SPEAKER_XX -> nome real. Abaixo disso,
-# melhor manter o rótulo genérico do que arriscar nomear errado (ver _map_speakers).
-REF_SIM_THRESHOLD = float(os.getenv("WHISPERX_REF_SIM_THRESHOLD", "0.5"))
 
 
 def _to_whisperx_audio(audio: np.ndarray, rate: int) -> np.ndarray:
@@ -26,29 +23,30 @@ def _to_whisperx_audio(audio: np.ndarray, rate: int) -> np.ndarray:
     return mono.astype(np.float32)
 
 
-def _cosine_sim(a, b) -> float:
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
-    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0.0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
-
-
 class WhisperXTranscriber(Transcriber):
-    """100% local: faster-whisper (transcrição) + wav2vec2 (alinhamento) + pyannote (diarização),
-       empacotados pelo whisperx. Modelos carregados uma vez aqui no __init__ e reusados por chunk.
+    """100% local: só faster-whisper (via whisperx) — sem alinhamento (wav2vec2) e sem
+       diarização (pyannote). Modelo carregado uma vez aqui no __init__ e reusado por chunk.
 
-       Diarização sai genérica (SPEAKER_00/SPEAKER_01...) do pyannote — pra virar nome real
-       (Raffa/Interlocutor), usamos `return_embeddings=True` da DiarizationPipeline (embedding por
-       SPEAKER_XX detectado, sem custo extra) e comparamos por similaridade de cosseno com o
-       embedding de cada referência ancorada (`refs`), extraído rodando a mesma pipeline no clip
-       de referência com `num_speakers=1`. Mesmo espaço vetorial dos dois lados, sem depender de
-       modelo de embedding adicional."""
+       Antes, o áudio ia mixado (mic+sistema) pra um pipeline de diarizar (identificar quem
+       fala por voz) e depois mapear pro nome real por similaridade com as referências
+       ancoradas. Medido em produção (14/08/2026): alinhamento + diarização somavam bem mais
+       tempo que a própria transcrição (ex.: 130s transcrição vs 163s + 515s dos outros dois
+       estágios, num chunk de 5 min) — o gargalo real não era o modelo de fala, era esse par.
+
+       MemoryMeet já sabe quem é quem sem precisar inferir nada: mic = você, loopback do
+       sistema = o outro lado, dois canais físicos capturados separadamente. Então cada canal
+       é transcrito isoladamente e rotulado direto pelo canal — elimina os dois estágios caros
+       por completo, sem trocar a precisão da atribuição (é física, não estimada por voz).
+
+       Ordem dos textos: cada segmento carrega o `start` (segundos desde o início do chunk)
+       devolvido pelo próprio whisper. Os segmentos dos dois canais são intercalados por esse
+       `start` antes de formatar (`transcribe_and_diarize` devolve a lista já mesclada) — nunca
+       "tudo do mic, depois tudo do sistema". Isso depende dos dois canais começarem no mesmo
+       instante do chunk, o que já é garantido pelo keep-alive de captura (ver histórico do
+       bug do "zíper" no BACKLOG) — sem ele, o `start` de cada canal não seria comparável."""
 
     def __init__(self):
         import whisperx
-        from whisperx.diarize import DiarizationPipeline
 
         self._whisperx = whisperx
         self.device = "cpu"
@@ -61,89 +59,36 @@ class WhisperXTranscriber(Transcriber):
             model_size, self.device, compute_type=compute_type,
             language=self.language, use_auth_token=hf_token,
         )
-        self.diarize_model = DiarizationPipeline(token=hf_token, device=self.device)
-        self.align_model, self.align_meta = whisperx.load_align_model(
-            language_code=self.language, device=self.device)
 
-        # Embedding de referência é caro (roda a pipeline de diarize inteira) e as refs são
-        # montadas uma vez em main.py e reusadas em todos os chunks — cachear por identidade
-        # evita recalcular a cada chunk de 5 min.
-        self._ref_embedding_cache: dict[int, list | None] = {}
-
-    def _ref_embedding(self, ref: SpeakerRef):
-        """Embedding do clip de referência (fala de um só canal, já filtrado pra janela de maior
-           energia em main.py) — roda a mesma DiarizationPipeline com num_speakers=1 e pega o
-           único embedding devolvido. None se a pipeline não conseguir extrair nada do clip."""
-        cache_key = id(ref)
-        if cache_key in self._ref_embedding_cache:
-            return self._ref_embedding_cache[cache_key]
-
-        emb = None
-        try:
-            wx_ref_audio = _to_whisperx_audio(ref.audio, ref.rate)
-            _, embeddings = self.diarize_model(wx_ref_audio, num_speakers=1, return_embeddings=True)
-            if embeddings:
-                emb = next(iter(embeddings.values()))
-        except Exception:
-            logging.exception("Falha ao extrair embedding da referência [%s]", ref.name)
-
-        self._ref_embedding_cache[cache_key] = emb
-        return emb
-
-    def _map_speakers(self, refs, speaker_embeddings):
-        """SPEAKER_XX (pyannote) -> nome real (Raffa/Interlocutor) por similaridade de cosseno
-           com as referências ancoradas. Sem refs ou sem embeddings, devolve mapeamento vazio —
-           os rótulos genéricos seguem intactos (compatibilidade com o comportamento atual).
-           Se a melhor similaridade ficar abaixo de REF_SIM_THRESHOLD, também não mapeia: é
-           melhor manter SPEAKER_XX do que atribuir um nome errado com baixa confiança."""
-        if not refs or not speaker_embeddings:
-            return {}
-
-        ref_embs = [(r.name, self._ref_embedding(r)) for r in refs]
-        ref_embs = [(name, emb) for name, emb in ref_embs if emb is not None]
-        if not ref_embs:
-            return {}
-
-        mapping = {}
-        for spk, emb in speaker_embeddings.items():
-            best_name, best_sim = None, -1.0
-            for name, ref_emb in ref_embs:
-                sim = _cosine_sim(emb, ref_emb)
-                if sim > best_sim:
-                    best_sim, best_name = sim, name
-            if best_name is not None and best_sim >= REF_SIM_THRESHOLD:
-                mapping[spk] = best_name
-            else:
-                logging.info("Speaker %s sem match confiável (melhor sim=%.2f) — mantendo rótulo genérico",
-                             spk, best_sim)
-        return mapping
-
-    def transcribe_and_diarize(self, audio, rate, refs):
+    def _transcribe_channel(self, audio: Optional[np.ndarray], rate: int, speaker_name: str):
+        """Transcreve um canal isolado. Devolve [(start, Segment)] — vazio se o canal não
+           teve áudio neste chunk ou não teve fala. `start` é a chave de ordenação usada em
+           transcribe_and_diarize pra intercalar os dois canais na ordem real da fala."""
+        if audio is None:
+            return []
         wx_audio = _to_whisperx_audio(audio, rate)
-
-        t0 = time.perf_counter()
         result = self.model.transcribe(wx_audio, batch_size=8, language=self.language)
+        out = []
+        for seg in result.get("segments", []):
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            out.append((seg.get("start", 0.0), Segment(speaker=speaker_name, text=text)))
+        return out
+
+    def transcribe_and_diarize(self, mic_audio, sys_audio, rate, mic_name, sys_name, refs):
+        t0 = time.perf_counter()
+        mic_segs = self._transcribe_channel(mic_audio, rate, mic_name)
+        sys_segs = self._transcribe_channel(sys_audio, rate, sys_name)
         t_transcricao = time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        result = self._whisperx.align(result["segments"], self.align_model, self.align_meta,
-                                       wx_audio, self.device)
-        t_alinhamento = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        diarize_df, speaker_embeddings = self.diarize_model(wx_audio, return_embeddings=True)
-        result = self._whisperx.assign_word_speakers(diarize_df, result)
-        speaker_map = self._map_speakers(refs, speaker_embeddings)
-        t_diarizacao = time.perf_counter() - t0
-
         logging.info(
-            "WhisperX — transcrição: %.1fs | alinhamento: %.1fs | diarização: %.1fs",
-            t_transcricao, t_alinhamento, t_diarizacao,
+            "WhisperX — transcrição por canal: %.1fs (mic: %d segmentos, sistema: %d segmentos)",
+            t_transcricao, len(mic_segs), len(sys_segs),
         )
 
-        segments = []
-        for seg in result.get("segments", []):
-            raw_speaker = seg.get("speaker", "") or "SPEAKER"
-            speaker = speaker_map.get(raw_speaker, raw_speaker)
-            segments.append(Segment(speaker=speaker, text=(seg.get("text") or "")))
-        return segments
+        # Merge estável por start: preserva a ordem real da conversa mesmo com os dois lados
+        # falando dentro do mesmo chunk de 5 min. sorted() é estável, então empates de start
+        # (raro, mas possível) mantêm mic antes de sistema — decisão arbitrária, não crítica.
+        merged = sorted(mic_segs + sys_segs, key=lambda item: item[0])
+        return [seg for _, seg in merged]

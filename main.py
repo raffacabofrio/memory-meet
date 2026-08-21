@@ -19,7 +19,7 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from transcribers import get_transcriber
-from transcribers.base import SpeakerRef
+from transcribers.base import SpeakerRef, mix_audio
 
 def _get_documents_dir() -> Path:
     try:
@@ -67,16 +67,6 @@ VU_W     = 220
 
 
 # ── áudio ─────────────────────────────────────────────────────────────────────
-
-def mix_frames(frames_a, frames_b):
-    min_len = min(len(frames_a), len(frames_b))
-    if min_len == 0:
-        return np.concatenate(frames_a) if frames_a else np.concatenate(frames_b)
-    a = np.concatenate(frames_a[:min_len]).astype(np.int32)
-    b = np.concatenate(frames_b[:min_len]).astype(np.int32)
-    s = min(len(a), len(b))
-    return np.clip((a[:s] + b[:s]) // 2, -32768, 32767).astype(np.int16)
-
 
 def audio_para_mp3(audio, rate):
     enc = lameenc.Encoder()
@@ -127,12 +117,14 @@ def format_segments(segments):
 
 @dataclass(frozen=True)
 class ChunkJob:
-    """Trabalho imutável: áudio já mixado (o MP3 já foi cortado/codificado e gravado em
-       disco pelo cortador — ver _cutter_loop) + snapshot das referências de voz. O worker
-       só transcreve; não mexe mais em áudio."""
+    """Trabalho imutável: canais mic/sistema separados (o MP3 mixado já foi cortado/codificado
+       e gravado em disco pelo cortador — ver _cutter_loop) + snapshot das referências de voz.
+       O worker transcreve cada canal isolado (sem mixar) — ver whisperx_transcriber.py sobre
+       por que manter os canais separados elimina alinhamento+diarização do WhisperX local."""
     index: int
-    audio: object         # np.ndarray mixado, ou None se o chunk não teve áudio
-    refs: tuple            # SpeakerRefs já ancoradas — worker não muta nada
+    mic_audio: object      # np.ndarray do canal do mic, ou None se não teve frame no chunk
+    sys_audio: object      # np.ndarray do canal do sistema, ou None se não teve frame no chunk
+    refs: tuple            # SpeakerRefs já ancoradas — worker não muta nada (usado só pelo backend OpenAI)
     is_final: bool
 
     @property
@@ -156,12 +148,13 @@ def processar_chunk(job: ChunkJob, transcriber, rate: int) -> ChunkResult:
        O áudio do chunk já está seguro em disco antes desta função rodar (gravado pelo
        cortador) — uma falha de transcrição aqui derruba só o texto, nunca o áudio."""
     try:
-        if job.audio is None:
+        if job.mic_audio is None and job.sys_audio is None:
             return ChunkResult(job.index, job.is_final, "")
         if transcriber is None:   # modelo falhou ao carregar — áudio já foi salvo mesmo assim
             logging.warning("Chunk %s — sem transcriber, só o áudio foi salvo", job.label)
             return ChunkResult(job.index, job.is_final, "")
-        segments = transcriber.transcribe_and_diarize(job.audio, rate, list(job.refs))
+        segments = transcriber.transcribe_and_diarize(
+            job.mic_audio, job.sys_audio, rate, SPEAKER_MIC, SPEAKER_SYS, list(job.refs))
         texto = format_segments(segments)
         logging.info("Chunk %s — %d segmentos, %d chars", job.label, len(segments), len(texto))
         return ChunkResult(job.index, job.is_final, texto)
@@ -582,38 +575,44 @@ class MemoryMeet:
                 self._chunk_index += 1
                 self._chunks_emitidos = self._chunk_index
                 label = "final" if parou else str(self._chunk_index)
-                audio = self._mixar_e_gravar_audio(mic, sys, label)
-                self.job_queue.put(ChunkJob(self._chunk_index, audio,
+                mic_audio, sys_audio = self._concat_e_gravar_audio(mic, sys, label)
+                self.job_queue.put(ChunkJob(self._chunk_index, mic_audio, sys_audio,
                                             self._speaker_refs(), parou))
                 self._update_progress()
             if parou:
                 return
 
-    def _mixar_e_gravar_audio(self, mic, sys, label):
-        """Mixa os frames crus do chunk e grava o MP3 no arquivo consolidado imediatamente
-           — antes mesmo de enfileirar o chunk pra transcrição. Devolve o áudio mixado (pro
-           worker transcrever) ou None se o chunk não tinha áudio. Roda só no cortador
-           (thread única, sequencial), então é o único escritor do MP3 — sem lock precisando
-           coordenar com o orquestrador, que agora só escreve o TXT."""
+    def _concat_e_gravar_audio(self, mic, sys, label):
+        """Concatena os frames crus de cada canal (mic e sistema ficam separados — o worker
+           transcreve cada um isolado, ver whisperx_transcriber.py) e grava o MP3 **mixado**
+           no arquivo consolidado imediatamente — antes mesmo de enfileirar o chunk pra
+           transcrição. O MP3 final continua sendo o mix dos dois canais (é o que se ouve),
+           só a transcrição parou de depender do mix. Devolve (mic_audio, sys_audio), cada um
+           None se o canal não teve frame no chunk. Roda só no cortador (thread única,
+           sequencial), então é o único escritor do MP3 — sem lock precisando coordenar com
+           o orquestrador, que agora só escreve o TXT."""
         if not mic and not sys:
-            return None
+            return None, None
         try:
-            audio = mix_frames(mic, sys) if (mic and sys) else (
-                    np.concatenate(mic) if mic else np.concatenate(sys))
-            logging.info("Chunk %s — samples: %d", label, len(audio))
+            mic_audio = np.concatenate(mic) if mic else None
+            sys_audio = np.concatenate(sys) if sys else None
+            logging.info("Chunk %s — samples mic: %d, sistema: %d", label,
+                         len(mic_audio) if mic_audio is not None else 0,
+                         len(sys_audio) if sys_audio is not None else 0)
         except Exception as e:
-            logging.error("Erro ao mixar chunk %s: %s", label, e, exc_info=True)
-            return None
+            logging.error("Erro ao concatenar chunk %s: %s", label, e, exc_info=True)
+            return None, None
         try:
-            mp3 = audio_para_mp3(audio, self.rate)
+            audio_mix = mix_audio(mic_audio, sys_audio)
+            mp3 = audio_para_mp3(audio_mix, self.rate)
             with open(self._mp3_path, "ab") as f:
                 f.write(mp3)
             logging.info("Chunk %s — MP3 %.1f MB gravado", label, len(mp3) / 1024 / 1024)
         except Exception as e:
             # Falha só na codificação/gravação do MP3 não deve derrubar a transcrição —
-            # o áudio mixado segue disponível em memória pro worker, mesmo sem ir pro disco.
+            # o áudio segue disponível em memória pro worker, mesmo sem ir pro disco.
             logging.error("Erro ao codificar/gravar MP3 do chunk %s: %s", label, e, exc_info=True)
-        return audio
+        return mic_audio, sys_audio
 
     def _worker_loop(self):
         self._transcriber_ready.wait()   # modelo carrega em background no startup
@@ -644,7 +643,7 @@ class MemoryMeet:
                 self._update_progress()
 
     def _gravar_resultado(self, r: ChunkResult):
-        # O MP3 já foi gravado pelo cortador (_mixar_e_gravar_audio) assim que o chunk
+        # O MP3 já foi gravado pelo cortador (_concat_e_gravar_audio) assim que o chunk
         # foi cortado — aqui só sobra o texto, que de fato precisa esperar a transcrição.
         if r.erro or not r.texto:
             return                      # erro já logado no worker; os próximos chunks seguem
