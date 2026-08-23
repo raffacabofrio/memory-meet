@@ -10,7 +10,7 @@ Itens pendentes e ideias futuras. O mais maduro fica no topo.
 
 **Causa raiz:** acoplamento desnecessário entre a gravação do áudio e a gravação do texto — os dois só aconteciam juntos, gatilhados pelo fim da transcrição, embora o áudio esteja pronto muito antes (assim que o cortador corta e o worker mixa/codifica, antes mesmo de chamar o transcriber).
 
-**Fix:** o MP3 agora é mixado e gravado em disco pelo **cortador** (`_cutter_loop` → novo `_mixar_e_gravar_audio`), na hora em que o chunk é cortado — antes de ser enfileirado pra transcrição. `ChunkJob` passou a carregar o áudio já mixado (em vez de `mic`/`sys` crus) e `ChunkResult` perdeu o campo `mp3` — o worker (`processar_chunk`) só transcreve. `_gravar_resultado` no orquestrador ficou só com o TXT, que continua reordenado por índice como antes. Efeito: se o app fechar/crashar no meio da transcrição de qualquer chunk (inclusive o "final", o buffer parcial ao apertar Parar — mesmo code path), o áudio dele já está seguro em disco; só o texto desse trecho específico fica faltando, que é uma falha bem menor (dá pra recuperar reprocessando o trecho do MP3, ver `skill-interview-feedback.md` no repo `projeto-carreira-2026`).
+**Fix:** o MP3 agora é mixado e gravado em disco pelo **cortador** (`_cutter_loop` → `_concat_e_gravar_audio`), na hora em que o chunk é cortado — antes de ser enfileirado pra transcrição. Desde a otimização local de 21/08, `ChunkJob` voltou a carregar `mic_audio` e `sys_audio` separados para o worker; a mistura existe apenas para gerar o MP3 consolidado. `ChunkResult` não carrega MP3 e `_gravar_resultado` no orquestrador ficou só com o TXT, que continua reordenado por índice como antes. Efeito: se o app fechar/crashar no meio da transcrição de qualquer chunk (inclusive o "final", o buffer parcial ao apertar Parar — mesmo code path), o áudio dele já está seguro em disco; só o texto desse trecho específico fica faltando, que é uma falha bem menor (dá pra recuperar reprocessando o trecho do MP3, ver `skill-interview-feedback.md` no repo `projeto-carreira-2026`).
 
 Sem lock novo: o cortador é thread única e sequencial, então é o único escritor do MP3 (o orquestrador, que também é único, ficou só com o TXT — arquivos diferentes, sem race).
 
@@ -23,43 +23,35 @@ Sem lock novo: o cortador é thread única e sequencial, então é o único escr
 Resolvido o bug do `_chunk_loop` síncrono (diagnóstico de 01/07, sentido na prática em 06/07: entrevista We Are Meta com "Finalizando" de ~18 min porque os chunks cresceram 5→9→14→18 min em cascata).
 
 ### Arquitetura
-- **Cortador** (`_cutter_loop`): corta a cada `CHUNK_SEGUNDOS` fixos, mixa e **já grava o MP3 em disco na hora** (`_mixar_e_gravar_audio`, ver fix de 23/07/2026 acima), depois enfileira `ChunkJob` imutável (áudio já mixado + snapshot das referências de voz). Nunca espera transcrição — chunk é sempre ~5 min, e o áudio nunca fica só em memória esperando o worker.
-- **Worker** (`_worker_loop` → `processar_chunk`): função **pura** — só transcrição. Zero side effects (sem arquivo, sem UI, sem estado compartilhado).
+- **Cortador** (`_cutter_loop`): corta a cada `CHUNK_SEGUNDOS` fixos, concatena cada canal separadamente, mixa uma cópia e **já grava o MP3 em disco na hora** (`_concat_e_gravar_audio`, ver fix de 23/07/2026 acima). Depois enfileira `ChunkJob` imutável com `mic_audio` + `sys_audio` + snapshot das referências de voz. Nunca espera transcrição — chunk é sempre ~5 min, e o áudio nunca fica só em memória esperando o worker.
+- **Worker** (`_worker_loop` → `processar_chunk`): função **pura** — só transcrição. No WhisperX, transcreve os dois canais isoladamente, rotula pela origem física e intercala por timestamp; no OpenAI, mixa os canais e usa a diarização da API. Zero side effects (sem arquivo, sem UI, sem estado compartilhado).
 - **Orquestrador** (`_orchestrator_loop`): consumidor único do resultado da transcrição. Reordena por índice e só ele escreve o TXT (ordem garantida) e atualiza a UI.
 - **Feedback sutil na UI:** "Gravando... · transcrevendo 2 de 3" durante a call; "Finalizando · trecho 4 de 4" no fim. Adeus spinner cego.
 
 ### Regra do WORKERS (decidido analisando o hardware em 06/07/2026)
-`MEMORYMEET_WORKERS` no `.env`, **default 1 — não subir neste notebook**: o ctranslate2 já paraleliza por dentro (~3,5 dos 8 cores do Ultra 5 115U), não sobra RAM pra segundo modelo (stack usa 4,7 GB de 15,5) e o pipeline pyannote não é confiável pra chamadas concorrentes no mesmo modelo. N>1 só faz sentido com GPU ou um modelo por worker.
+`MEMORYMEET_WORKERS` no `.env`, **default 1 — não subir neste notebook**: o ctranslate2 já paraleliza por dentro (~3,5 dos 8 cores do Ultra 5 115U) e os workers compartilham uma única instância do modelo. A remoção de pyannote reduziu muito o peso do pipeline, mas N>1 continua sem validação de concorrência e sem necessidade prática neste hardware.
 
 ---
 
-## 🟡 Migrar transcrição+diarização pra local (faster-whisper + pyannote.audio) — registrado 01/07/2026, implementação iniciada 03/07/2026
+## ✅ FEITO — Transcrição local rápida com identificação física por canal — 03/07 a 23/08/2026
 
-**Status (16/07/2026):** camada `transcribers/` implementada e validada ponta a ponta — `TRANSCRIBER=openai|whisperx` no `.env`, WhisperX rodando 100% local (venv Python 3.12 dedicado, ver README). **Mapeamento `SPEAKER_XX` -> nome real implementado** em `transcribers/whisperx_transcriber.py`: `DiarizationPipeline(..., return_embeddings=True)` devolve embedding por `SPEAKER_XX` do chunk; o embedding de cada referência ancorada (`refs`, já vinha de `main.py` mas era ignorado) é extraído rodando a mesma pipeline no clip com `num_speakers=1` (cacheado por referência — evita recalcular a cada chunk de 5 min); casamento por similaridade de cosseno, com `WHISPERX_REF_SIM_THRESHOLD` (default `0.5`, env-configurável) como piso de confiança — abaixo disso mantém o rótulo genérico em vez de arriscar nome errado. Sem `refs` (lista vazia/None), comportamento idêntico ao anterior (rótulos genéricos), sem quebrar. Validado: import limpo, smoke test da lógica de matching (`_cosine_sim`/`_map_speakers`) isolado sem baixar modelos. **Não validado ainda** com gravação real (pipeline completo baixa modelos pyannote gated na primeira execução — não rodado nesta sessão); threshold de `0.5` é um chute razoável, não calibrado com dados reais — ajustar se sair nome errado ou rótulo genérico demais na prática. **Ainda pendente:** decidir se vale resolver o cold start de ~3min pra carregar os modelos (hoje eager no `__init__`).
+**Estado final:** camada `transcribers/` plugável e validada ponta a ponta — `TRANSCRIBER=openai|whisperx` no `.env`. O backend padrão roda 100% local em Python 3.12, sem custo por minuto, sem enviar áudio e sem depender de token/modelo gated do Hugging Face.
 
-**Carta na manga — hardware real da máquina (checado 03/07/2026):** o notebook é um **Intel Core Ultra 5 115U** (Meteor Lake) — tem GPU integrada (Intel Graphics Xe-LPG) e até um **NPU** dedicado pra IA. Não é "sem hardware de IA", é que a stack atual não sabe usar esse hardware: `ctranslate2` (motor do `faster-whisper`) só acelera em CPU ou GPU NVIDIA/CUDA; `whisperx` crava `device="cpu"`/`"cuda"` no código, sem caminho pra iGPU/NPU Intel.
+O primeiro caminho local reproduzia integralmente o pipeline de diarização: faster-whisper → alinhamento wav2vec2 → pyannote → embeddings de referência para converter `SPEAKER_XX` em nomes. Funcionava, mas as métricas adicionadas em 24/07 mostraram que estávamos pagando para inferir uma informação já conhecida pela captura. Numa gravação real de 21/08, um chunk cheio de 5 minutos levou em média **50,4s para transcrever, 67,1s para alinhar e 191,3s para diarizar** — 308,8s no total, ligeiramente mais que a duração do próprio chunk.
 
-Se a família de modelos atual (`tiny`→`large-v3`/`turbo`, todos via `ctranslate2`/CPU) não entregar velocidade ou precisão suficiente, o próximo lugar pra fazer discovery **não é subir de modelo dentro da mesma stack** — é trocar de stack: **OpenVINO** (toolkit da própria Intel, com modelos Whisper otimizados que rodam na iGPU e no NPU do Core Ultra). É uma troca de motor de inferência inteira (substitui `ctranslate2`/`faster-whisper`, não só uma variável de `.env`), então só vale investigar se o caminho atual em CPU se provar insuficiente na prática.
+**Virada de 21/08:** o WhisperX local passou a receber `mic_audio` e `sys_audio` separados, transcrever cada canal isoladamente, atribuir os nomes configurados pela origem física (`mic = Raffa`, `sistema = Interlocutor`) e intercalar os segmentos pelo `start` retornado pelo Whisper. Alinhamento, pyannote, embeddings, threshold de similaridade e referências de voz foram eliminados do backend local. O OpenAI continua mixando os canais e usando `gpt-4o-transcribe-diarize`, preservando a alternativa de diarização real na nuvem.
 
-**Justificativa do Raffa:** a API da OpenAI (`gpt-4o-transcribe-diarize`) está instável — **perdemos chunks inteiros em duas sessões diferentes** (hoje: chunk 3 da call ACT/BTG, timeout total após 2 retries; e a sessão da entrevista Nava/BMG também precisou de recuperação via reprocessamento do MP3). Além da instabilidade, um modelo local elimina custo por minuto.
+**Validação real em 23/08/2026:** Raffa testou o fluxo ponta a ponta e confirmou melhora brutal de performance, **sem efeitos colaterais observados** em qualidade da transcrição, atribuição de falantes, áudio salvo ou finalização. Migração encerrada.
 
-**Contexto técnico (da investigação de 01/07/2026):** o gargalo de hoje foi causado por uma combinação de (a) o modelo da OpenAI dar timeout de 180s repetidamente em chunks de ~5-6 min, e (b) o `_chunk_loop` em `main.py` ser síncrono — o timer do próximo chunk só recomeça depois que o anterior termina de processar (com todos os retries), o que faz um chunk lento inflar o próximo (cascata: 5min → 14min → timeout total). Ver sessão `sessions/2026-07-01 - microfone code22, gargalo memorymeet e entrevista act-btg.md` no repo `projeto-carreira-2026` para o diagnóstico completo (inclui proposta de fix incremental: paralelizar `_processar_chunk` e/ou reduzir `CHUNK_SEGUNDOS`, discussão ainda pendente).
+**Por que a migração nasceu:** a API da OpenAI perdeu chunks inteiros em duas sessões diferentes por timeout, tinha custo por minuto e, combinada ao antigo `_chunk_loop` síncrono, produziu a cascata 5→9→14→18 minutos. O pipeline paralelo resolveu a cascata em 06/07; a transcrição local removeu instabilidade e custo; a separação física dos canais resolveu a performance local em 21/08.
 
-**Caminho de migração (levantado em conversa, não validado ainda):**
-- **faster-whisper** (ou `openai-whisper`) para transcrição local — CPU ou GPU, sem custo por minuto.
-- **pyannote.audio** para diarização — grátis, mas os modelos pretrained são "gated" no Hugging Face (aceitar licença + gerar token, sem custo).
-- **WhisperX** empacota os dois com alinhamento palavra-a-palavra — é o caminho mais direto pra reproduzir o que o app faz hoje, 100% local.
-
-**Trade-offs a validar antes de migrar:**
-- **Sem GPU dedicada neste notebook** (só Intel Graphics integrado, sem `nvidia-smi` — checado em 01/07/2026). `faster-whisper` roda razoável em CPU (modelo pequeno/médio + int8); `pyannote.audio` em CPU é mais lento que com GPU. **Não é bloqueio real:** a arquitetura já processa em chunks com antecedência (não é tempo real hoje, mesmo com a API da OpenAI), então o que importa é só não acumular atraso indefinidamente — mesmo critério que já vale pro bug do `_chunk_loop` síncrono acima. Raffa está otimista que CPU dá conta nesse regime.
-- A diarização por pyannote tende a ser um pouco menos estável em trocas rápidas de falante do que a abordagem atual (duas referências de voz ancoradas por canal, mic/sistema) — pode precisar adaptar a lógica de referência ancorada pro pyannote, não só trocar o modelo.
-- ~~Não elimina o bug do `_chunk_loop` síncrono por si só~~ — resolvido em 06/07/2026 com o pipeline cortador→worker→orquestrador (ver item FEITO acima).
+**OpenVINO arquivado como carta na manga, não como pendência:** o Intel Core Ultra 5 115U tem iGPU/NPU, mas ctranslate2 usa CPU ou CUDA. Como o caminho atual em CPU ficou rápido e estável depois da remoção de alinhamento/pyannote, não há motivo para trocar de motor agora. OpenVINO só volta à mesa se surgir uma necessidade nova de precisão ou performance que a stack atual não atenda.
 
 ---
 
-## ✅ FEITO — Diarização (identificar quem fala) — 30/06/2026
+## ✅ FEITO — Diarização no backend OpenAI — 30/06/2026
 
-Implementado e **provado funcionando** end-to-end. O TXT agora sai com os falantes separados e nomeados:
+Implementado e **provado funcionando** end-to-end. Este desenho continua disponível quando `TRANSCRIBER=openai`; o backend local não usa mais diarização e identifica o falante pelo canal físico. O TXT sai com os falantes separados e nomeados:
 
 ```
 [Interlocutor] Estou querendo agora que o Flávio Bolsonaro responda...
@@ -92,9 +84,9 @@ Implementado e **provado funcionando** end-to-end. O TXT agora sai com os falant
 
 ---
 
-## 💭 Alternativa de design considerada — canais separados (mais simples, adiada)
+## ✅ ADOTADA — Canais separados no backend local — decidida 21/08, validada 23/08/2026
 
-Em vez de mixar + diarize + referências, dava pra **transcrever cada canal separado** (mic=Raffa, sistema=Interlocutor) e juntar por timestamp. Vantagens: atribuição **física** (não inferida), sem referências, sem o modelo de diarize, sem limite de 1024KB. Mas **também depende do fix de sincronia** (o canal do sistema comprimido desalinha o merge igual). Como o caminho atual (mix+diarize) já está provado e funcionando, ficou adiada — vale revisitar se quisermos simplificar.
+Nasceu como alternativa adiada porque o caminho mix+diarize já funcionava. As métricas de produção mostraram que alinhamento e diarização eram o gargalo dominante, então a alternativa virou a arquitetura final do WhisperX: **transcrever cada canal separado** (mic=Raffa, sistema=Interlocutor) e juntar por timestamp. Atribuição física, sem referências, pyannote, embeddings ou limite de 1024KB. Continua dependendo do keep-alive que mantém os canais sincronizados; esse fundamento já estava validado desde o bug do "zíper". O teste real confirmou o ganho brutal sem efeitos colaterais observados.
 
 ---
 
@@ -114,7 +106,7 @@ Raffa abre a aba do MemoryMeet **antes** da agenda → o app pede o que capturar
 ### Peças e viabilidade
 - **Mic (Raffa):** `getUserMedia({audio})` — trivial.
 - **Outro lado (Interlocutor):** `getDisplayMedia({audio:true})` compartilhando a aba da reunião. **Chrome/Edge no Windows.**
-- **Separação de speaker:** dois `MediaStream` = dois canais físicos → **rotular por canal e descartar o pyannote inteiro**. A peça sem porta boa em JS é exatamente a que não precisaríamos portar — mesma estratégia de canal ancorado que já dá o melhor resultado hoje (mic=Raffa, loopback=Interlocutor).
+- **Separação de speaker:** dois `MediaStream` = dois canais físicos → **rotular por canal e descartar o pyannote inteiro**. A peça sem porta boa em JS é exatamente a que não precisaríamos portar — mesma estratégia de canal físico agora validada no app nativo (mic=Raffa, loopback=Interlocutor).
 - **Transcrição:** `transformers.js` (Xenova/whisper) via WASM ou **WebGPU**.
 - **Saída MP3/TXT:** `lamejs`/MediaRecorder + File System Access API.
 
