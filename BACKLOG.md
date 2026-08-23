@@ -1,6 +1,17 @@
 # BACKLOG — MemoryMeet
 
-Itens pendentes e ideias futuras. O mais maduro fica no topo.
+Fila aberta em ordem de prioridade. Decisões concluídas permanecem abaixo como memória técnica.
+
+## Prioridades abertas
+
+| Prioridade | Frente | Por que agora | Próximo passo |
+|---:|---|---|---|
+| **P1** | Instância única | Pequeno, útil e fecha uma falha operacional concreta | Detectar a instância existente e trazer sua janela para frente |
+| **P2** | Distribuição via `.exe` | Transforma o projeto em aplicativo realmente instalável | Empacotar com PyInstaller e validar modelos, assets, caminhos e cold start |
+| **P3** | Benchmark WebGPU para a PWA | Experimento barato que decide se a versão navegador merece investimento | Criar página isolada que transcreve um áudio e mede o fator de tempo real |
+| **P4** | Nomes reais via Google Agenda | Melhora de conveniência, com impacto menor agora que os labels já funcionam | Ler participantes do evento e mapear `[Interlocutor]`; voiceprints ficam como evolução posterior |
+
+**Fora da fila:** OpenVINO permanece apenas como carta na manga. O pipeline nativo atual está rápido, estável e validado.
 
 ---
 
@@ -90,13 +101,19 @@ Nasceu como alternativa adiada porque o caminho mix+diarize já funcionava. As m
 
 ---
 
-## 💡 Futuro — Nomes reais dos interlocutores via Google Agenda
+## P1 — Instância única
 
-Integrar com o Google Calendar pra puxar os participantes do evento e mapear `[Interlocutor]` para o nome real do convidado. Evolução: biblioteca de voiceprints em `APP_DIR` — uma vez identificado "Bruno", reconhecê-lo em calls futuras.
+Se o app já estiver aberto, uma segunda execução deve detectar a instância existente, trazer sua janela para frente e encerrar sem abrir outra cópia.
 
 ---
 
-## 💡 Futuro — Versão navegador (PWA em JS), zero instalação — emergida 09/07/2026
+## P2 — Distribuição via `.exe`
+
+Empacotar com PyInstaller para rodar sem Python instalado. Validar inclusão de assets e dependências, resolução dos caminhos de saída, download/cache do modelo Whisper e comportamento do cold start na versão empacotada.
+
+---
+
+## P3 — Benchmark WebGPU e versão navegador (PWA em JS), zero instalação — emergida 09/07/2026
 
 Ideia: uma versão do MemoryMeet que roda 100% no navegador, sem Python, sem setup. Bom pra "abre e grava" rápido, mantendo o app nativo como ferramenta séria (background, performance, entrevista longa).
 
@@ -122,7 +139,6 @@ Meet é sempre no navegador → share da aba funciona limpo. **Teams no app desk
 
 ---
 
-## 📌 Itens antigos (da v2, sessão de nascimento 19/06/2026)
+## P4 — Nomes reais dos interlocutores via Google Agenda
 
-- **Instância única** — se o app já estiver aberto, trazer a janela pra frente em vez de abrir outra.
-- **Distribuição via `.exe`** (PyInstaller) — rodar sem Python instalado.
+Integrar com o Google Calendar pra puxar os participantes do evento e mapear `[Interlocutor]` para o nome real do convidado. Evolução posterior: biblioteca de voiceprints em `APP_DIR` — uma vez identificado "Bruno", reconhecê-lo em calls futuras.
