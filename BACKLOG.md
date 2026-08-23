@@ -6,10 +6,9 @@ Fila aberta em ordem de prioridade. Decisões concluídas permanecem abaixo como
 
 | Prioridade | Frente | Por que agora | Próximo passo |
 |---:|---|---|---|
-| **P1** | Instância única | Pequeno, útil e fecha uma falha operacional concreta | Detectar a instância existente e trazer sua janela para frente |
-| **P2** | Distribuição via `.exe` | Transforma o projeto em aplicativo realmente instalável | Empacotar com PyInstaller e validar modelos, assets, caminhos e cold start |
-| **P3** | Benchmark WebGPU para a PWA | Experimento barato que decide se a versão navegador merece investimento | Criar página isolada que transcreve um áudio e mede o fator de tempo real |
-| **P4** | Nomes reais via Google Agenda | Melhora de conveniência, com impacto menor agora que os labels já funcionam | Ler participantes do evento e mapear `[Interlocutor]`; voiceprints ficam como evolução posterior |
+| **P1** | Distribuição via `.exe` | Transforma o projeto em aplicativo realmente instalável | Empacotar com PyInstaller e validar modelos, assets, caminhos e cold start |
+| **P2** | Benchmark WebGPU para a PWA | Experimento barato que decide se a versão navegador merece investimento | Criar página isolada que transcreve um áudio e mede o fator de tempo real |
+| **P3** | Nomes reais via Google Agenda | Melhora de conveniência, com impacto menor agora que os labels já funcionam | Ler participantes do evento e mapear `[Interlocutor]`; voiceprints ficam como evolução posterior |
 
 **Cancelado:** migração para OpenVINO. A otimização do pipeline atual resolveu o problema de performance; trocar o motor de inferência virou complexidade sem benefício concreto.
 
@@ -105,19 +104,21 @@ Nasceu como alternativa adiada porque o caminho mix+diarize já funcionava. As m
 
 ---
 
-## P1 — Instância única
+## ✅ FEITO — Instância única — 23/08/2026
 
-Se o app já estiver aberto, uma segunda execução deve detectar a instância existente, trazer sua janela para frente e encerrar sem abrir outra cópia.
+Implementado com mutex nomeado Win32 (`Local\MemoryMeet.SingleInstance`), adquirido antes dos imports pesados. Se o app já estiver aberto, a segunda execução localiza a janela `MemoryMeet`, restaura se estiver minimizada, traz para frente e encerra sem carregar UI, áudio, NumPy ou o modelo. O handle permanece vivo durante todo o processo e é liberado no fechamento.
+
+**Verificação:** testes automatizados cobrem primeira/segunda instância, aquisição idempotente pelo processo dono e liberação do mutex para uma execução posterior. Compilação e import isolado de `main.py` também validados.
 
 ---
 
-## P2 — Distribuição via `.exe`
+## P1 — Distribuição via `.exe`
 
 Empacotar com PyInstaller para rodar sem Python instalado. Validar inclusão de assets e dependências, resolução dos caminhos de saída, download/cache do modelo Whisper e comportamento do cold start na versão empacotada.
 
 ---
 
-## P3 — Benchmark WebGPU e versão navegador (PWA em JS), zero instalação — emergida 09/07/2026
+## P2 — Benchmark WebGPU e versão navegador (PWA em JS), zero instalação — emergida 09/07/2026
 
 Ideia: uma versão do MemoryMeet que roda 100% no navegador, sem Python, sem setup. Bom pra "abre e grava" rápido, mantendo o app nativo como ferramenta séria (background, performance, entrevista longa).
 
@@ -143,6 +144,6 @@ Meet é sempre no navegador → share da aba funciona limpo. **Teams no app desk
 
 ---
 
-## P4 — Nomes reais dos interlocutores via Google Agenda
+## P3 — Nomes reais dos interlocutores via Google Agenda
 
 Integrar com o Google Calendar pra puxar os participantes do evento e mapear `[Interlocutor]` para o nome real do convidado. Evolução posterior: biblioteca de voiceprints em `APP_DIR` — uma vez identificado "Bruno", reconhecê-lo em calls futuras.

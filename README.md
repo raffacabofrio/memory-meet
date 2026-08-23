@@ -22,6 +22,7 @@ No subscriptions. No time limits. No distractions.
 - **Local-first**: transcription runs 100% on your machine by default (WhisperX) — no audio leaves your computer, no per-minute cost. OpenAI API available as a plug-in alternative
 - Live progress in the UI: `transcribing 2 of 3` — never a blind spinner
 - Saves MP3 + TXT to `~/Documents/MemoryMeet/`
+- Single-instance behavior: opening MemoryMeet again restores and focuses the existing window instead of loading a second copy
 
 ## Architecture
 
@@ -69,6 +70,8 @@ flowchart LR
 **OpenAI speaker references.** The cloud backend still mixes the channels and uses real voice diarization. Because diarization models may renumber speakers between chunks, MemoryMeet builds a clean reference from each physical channel and sends those references to `gpt-4o-transcribe-diarize`, keeping labels stable across the meeting.
 
 **The last chunk that never made it to disk.** Until 2026-07-23, the MP3 append and the TXT append happened together in `_gravar_resultado`, both gated on the *entire* transcription finishing for that chunk — even though the mixed audio exists long before transcription even starts. Close the app (or have it crash) while the last chunk is still transcribing, and its audio — already cut, mixed, and sitting in memory — never reaches the consolidated MP3. It's not delayed, it's gone. Fix: the cutter now mixes and writes each chunk's MP3 immediately after slicing, decoupled from transcription entirely; only the TXT append stays gated on transcription success. Worst case now is a missing transcript for one chunk (recoverable by re-transcribing that slice of the MP3), never missing audio.
+
+**One app means one model.** A named Win32 mutex is acquired before the heavy imports. A second launch detects the running instance, restores and focuses its window, then exits before loading the UI, audio stack, NumPy, or transcription model.
 
 ## Requirements
 

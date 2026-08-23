@@ -2,6 +2,16 @@ import sys, site
 if site.getusersitepackages() not in sys.path:
     sys.path.insert(0, site.getusersitepackages())
 
+from single_instance import APP_TITLE, SingleInstanceGuard
+
+# Adquire antes dos imports pesados: uma segunda execução ativa a janela existente
+# e encerra sem carregar UI, áudio, NumPy ou o modelo de transcrição.
+_instance_guard = None
+if __name__ == "__main__":
+    _instance_guard = SingleInstanceGuard()
+    if not _instance_guard.acquire():
+        raise SystemExit(0)
+
 import tkinter as tk
 import customtkinter as ctk
 import pyaudiowpatch as pyaudio
@@ -168,7 +178,7 @@ def processar_chunk(job: ChunkJob, transcriber, rate: int) -> ChunkResult:
 class MemoryMeet:
     def __init__(self, root):
         self.root = root
-        self.root.title("MemoryMeet")
+        self.root.title(APP_TITLE)
         self.root.resizable(False, False)
         self.root.geometry("320x360")
         self.root.configure(fg_color=BG)
@@ -753,3 +763,5 @@ if __name__ == "__main__":
             f.write(f"\n{'='*50}\n")
             traceback.print_exc(file=f)
         raise
+    finally:
+        _instance_guard.close()
