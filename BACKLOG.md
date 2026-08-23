@@ -11,7 +11,7 @@ Fila aberta em ordem de prioridade. Decisões concluídas permanecem abaixo como
 | **P3** | Benchmark WebGPU para a PWA | Experimento barato que decide se a versão navegador merece investimento | Criar página isolada que transcreve um áudio e mede o fator de tempo real |
 | **P4** | Nomes reais via Google Agenda | Melhora de conveniência, com impacto menor agora que os labels já funcionam | Ler participantes do evento e mapear `[Interlocutor]`; voiceprints ficam como evolução posterior |
 
-**Fora da fila:** OpenVINO permanece apenas como carta na manga. O pipeline nativo atual está rápido, estável e validado.
+**Cancelado:** migração para OpenVINO. A otimização do pipeline atual resolveu o problema de performance; trocar o motor de inferência virou complexidade sem benefício concreto.
 
 ---
 
@@ -56,7 +56,11 @@ O primeiro caminho local reproduzia integralmente o pipeline de diarização: fa
 
 **Por que a migração nasceu:** a API da OpenAI perdeu chunks inteiros em duas sessões diferentes por timeout, tinha custo por minuto e, combinada ao antigo `_chunk_loop` síncrono, produziu a cascata 5→9→14→18 minutos. O pipeline paralelo resolveu a cascata em 06/07; a transcrição local removeu instabilidade e custo; a separação física dos canais resolveu a performance local em 21/08.
 
-**OpenVINO arquivado como carta na manga, não como pendência:** o Intel Core Ultra 5 115U tem iGPU/NPU, mas ctranslate2 usa CPU ou CUDA. Como o caminho atual em CPU ficou rápido e estável depois da remoção de alinhamento/pyannote, não há motivo para trocar de motor agora. OpenVINO só volta à mesa se surgir uma necessidade nova de precisão ou performance que a stack atual não atenda.
+---
+
+## ❌ CANCELADO — Migrar o backend local para OpenVINO — 23/08/2026
+
+Foi considerado para aproveitar a iGPU/NPU do Intel Core Ultra 5 115U quando o pipeline WhisperX ainda estava lento. A separação física dos canais e a remoção de alinhamento/pyannote resolveram a performance sem trocar o motor de inferência. **Decisão: não tocar nisso** — seria uma mudança grande, sem problema atual para resolver.
 
 ---
 
