@@ -13,6 +13,7 @@ import os
 import time
 import logging
 import lameenc
+import winsound
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -56,6 +57,9 @@ SPEAKER_MIC    = os.getenv("MEMORYMEET_SPEAKER", "Me")               # rótulo d
 SPEAKER_SYS    = os.getenv("MEMORYMEET_INTERLOCUTOR", "Interlocutor")  # rótulo do canal do sistema (o outro lado)
 REF_ALVO_SEG    = 8         # duração da janela de referência de voz (2-10s)
 REF_MIN_ENERGIA = 150       # piso de energia (mean abs int16) p/ considerar que o canal tem fala (não ancorar silêncio)
+
+LIMITE_INICIAL_SEG  = 60 * 60  # a partir daqui passa a perguntar se continua gravando
+DIALOG_TIMEOUT_SEG  = 5        # quanto tempo a caixa de confirmação fica aberta antes de expirar
 
 BG       = "#1a1a2e"
 RED      = "#e05050"
@@ -181,6 +185,14 @@ class MemoryMeet:
         self.stop_event       = threading.Event()
         self.start_time       = None
         self.timer_job        = None
+        # Limite de duração + diálogo de confirmação (ver _abrir_dialogo_limite)
+        self._limite_seg          = LIMITE_INICIAL_SEG
+        self._dialog_aberto        = False
+        self._dialog_resposta      = None
+        self._dialog_window        = None
+        self._dialog_deadline      = None
+        self._dialog_countdown_label = None
+        self._som_ativo            = False
         self._thread_mic      = None
         self._thread_sys      = None
         self._thread_keepalive = None
@@ -427,6 +439,8 @@ class MemoryMeet:
         self._chunks_emitidos   = 0
         self._chunks_concluidos = 0
         self._txt_escrito       = False
+        self._limite_seg        = LIMITE_INICIAL_SEG
+        self._dialog_aberto     = False
         self.job_queue    = queue.Queue()
         self.result_queue = queue.Queue()
 
@@ -457,6 +471,8 @@ class MemoryMeet:
         self.gravando = False
         self._duracao_gravada = int(time.time() - self.start_time)
         self.stop_event.set()
+        if self._dialog_aberto:
+            self._fechar_dialogo()
         if self.timer_job:
             self.root.after_cancel(self.timer_job)
         self.btn_parar.configure(fg_color="#2a2a3a", hover_color="#2a2a3a",
@@ -465,11 +481,113 @@ class MemoryMeet:
         self.root.after(0, lambda: self._start_spinner("Finalizando", ORANGE))
 
     def _tick(self):
+        if not self.gravando:
+            return
+        elapsed = int(time.time() - self.start_time)
+        m, s = divmod(elapsed, 60)
+        self.lbl_timer.configure(text=f"{m:02d}:{s:02d}")
+        if not self._dialog_aberto and elapsed >= self._limite_seg:
+            self._abrir_dialogo_limite()
+        self.timer_job = self.root.after(1000, self._tick)
+
+    # ── limite de duração / diálogo de confirmação ───────────────────────────────
+
+    def _abrir_dialogo_limite(self):
+        """Disparado pelo _tick quando a gravação atinge self._limite_seg. Mostra uma
+           janela modal com foco forçado + beep repetido, pedindo pro usuário escolher
+           +15 ou +30 min. Se não responder em DIALOG_TIMEOUT_SEG, a gravação é parada."""
+        self._dialog_aberto   = True
+        self._dialog_resposta = None
+        self._som_ativo       = True
+        threading.Thread(target=self._tocar_beeps, daemon=True).start()
+
+        win = ctk.CTkToplevel(self.root)
+        self._dialog_window = win
+        win.title("MemoryMeet")
+        win.resizable(False, False)
+        win.configure(fg_color=BG)
+        win.geometry("300x180")
+        win.protocol("WM_DELETE_WINDOW", lambda: None)  # não deixa fechar pelo X — só pelos botões ou timeout
+
+        ctk.CTkLabel(
+            win, text="Gravação longa — continuar?",
+            font=ctk.CTkFont(size=14, weight="bold"), text_color="#e0e0f8"
+        ).pack(pady=(20, 6))
+
+        self._dialog_countdown_label = ctk.CTkLabel(
+            win, text=f"Sem resposta em {DIALOG_TIMEOUT_SEG}s a gravação é encerrada",
+            font=ctk.CTkFont(size=11), text_color=ORANGE
+        )
+        self._dialog_countdown_label.pack(pady=(0, 14))
+
+        frame_btns = ctk.CTkFrame(win, fg_color="transparent")
+        frame_btns.pack(pady=(0, 12))
+        ctk.CTkButton(
+            frame_btns, text="+15 min", width=110, height=36,
+            fg_color=BLUE, hover_color="#3a7ecc",
+            command=lambda: self._responder_dialogo(15 * 60)
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(
+            frame_btns, text="+30 min", width=110, height=36,
+            fg_color=BLUE, hover_color="#3a7ecc",
+            command=lambda: self._responder_dialogo(30 * 60)
+        ).pack(side="left", padx=6)
+
+        # foco forçado: topmost + lift + focus_force, pra garantir que o usuário vê a janela
+        win.attributes("-topmost", True)
+        win.lift()
+        win.focus_force()
+        win.grab_set()
+
+        self._dialog_deadline = time.time() + DIALOG_TIMEOUT_SEG
+        self._dialog_tick()
+
+    def _tocar_beeps(self):
+        """Beep repetido enquanto o diálogo estiver aberto. winsound.Beep bloqueia a
+           própria thread pela duração do som — por isso roda numa thread separada, não
+           no mainloop do Tk."""
+        try:
+            while self._som_ativo:
+                winsound.Beep(1000, 200)
+                time.sleep(0.3)
+        except Exception as e:
+            logging.warning("Falha ao tocar beep do diálogo de limite: %s", e)
+
+    def _dialog_tick(self):
+        if not self._dialog_aberto:
+            return
+        restante = self._dialog_deadline - time.time()
+        if restante <= 0:
+            self._dialog_timeout()
+            return
+        self._dialog_countdown_label.configure(
+            text=f"Sem resposta em {int(restante) + 1}s a gravação é encerrada"
+        )
+        self.root.after(200, self._dialog_tick)
+
+    def _fechar_dialogo(self):
+        self._dialog_aberto = False
+        self._som_ativo     = False
+        if self._dialog_window is not None:
+            try:
+                self._dialog_window.grab_release()
+                self._dialog_window.destroy()
+            except Exception:
+                pass
+            self._dialog_window = None
+
+    def _responder_dialogo(self, extensao_seg):
+        self._limite_seg += extensao_seg
+        logging.info("Diálogo de limite: usuário estendeu +%dmin (novo limite: %dmin)",
+                     extensao_seg // 60, self._limite_seg // 60)
+        self._fechar_dialogo()
+
+    def _dialog_timeout(self):
+        logging.info("Diálogo de limite: sem resposta em %ds — encerrando gravação",
+                     DIALOG_TIMEOUT_SEG)
+        self._fechar_dialogo()
         if self.gravando:
-            elapsed = int(time.time() - self.start_time)
-            m, s = divmod(elapsed, 60)
-            self.lbl_timer.configure(text=f"{m:02d}:{s:02d}")
-            self.timer_job = self.root.after(1000, self._tick)
+            self.parar()
 
     # ── VU meter ──────────────────────────────────────────────────────────────
 
