@@ -59,7 +59,7 @@ REF_ALVO_SEG    = 8         # duração da janela de referência de voz (2-10s)
 REF_MIN_ENERGIA = 150       # piso de energia (mean abs int16) p/ considerar que o canal tem fala (não ancorar silêncio)
 
 LIMITE_INICIAL_SEG  = 60 * 60  # a partir daqui passa a perguntar se continua gravando
-DIALOG_TIMEOUT_SEG  = 5        # quanto tempo a caixa de confirmação fica aberta antes de expirar
+DIALOG_TIMEOUT_SEG  = 10       # quanto tempo a caixa de confirmação fica aberta antes de expirar
 
 BG       = "#1a1a2e"
 RED      = "#e05050"
